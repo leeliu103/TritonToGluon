@@ -79,6 +79,7 @@ class TracePromptBuilder:
     def build_prompt(self, op: BuiltinOp) -> str:
         analysis_goals = (
             "Deeply trace this single Gluon builtin across the lowering stack:\n"
+            "Use Codex MCP tools to do any coding-related task (analysis, generate, search, read files, etc.).\n"
             "  1. Read the builtin definition carefully and capture the COMPLETE function interface as a code string.\n"
             "     Include every parameter exactly as written in the function signature: required args, optional args with their default values, keyword-only args, and any *args/**kwargs.\n"
             "     If the op has BOTH a function form AND an operator syntax sugar form, include both:\n"
@@ -93,8 +94,12 @@ class TracePromptBuilder:
             "     TTGIR ops are emitted and how operands/attributes are computed.\n"
             "  4. Describe the TTGIR ops in execution order. Each entry should be\n"
             "     a `dialect.operation` string (e.g., ttg.make_range).\n"
-            "  5. Summarize the semantics and lowering logic using information from\n"
-            "     the actual code—do not rely on surface summaries.\n"
+            "  5. Write the `lowering_summary` as a concise semantic map from the Gluon op to the TTGIR ops it emits.\n"
+            "     Describe the core decision logic (e.g., dtype checks, broadcasting, specialization branches) that governs\n"
+            "     which TTGIR constructs appear and why. Emphasize the essential semantics and relationships so someone\n"
+            "     could later infer the reverse mapping from TTGIR back to Gluon. Avoid surface details such as file paths,\n"
+            "     helper function names, or incidental implementation trivia—only mention names when they are indispensable\n"
+            "     to the semantic explanation.\n"
             "  6. Search ONLY the ALL_GLUON_EXAMPLE_FILES listed below for the\n"
             "     most typical real kernel usage of this builtin.\n"
             "     Prefer examples from tutorial files over test files.\n"
