@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Output files
+outputs/*.md
+outputs/*.json
+outputs/*.txt
+
+# Keep outputs folder structure
+!outputs/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db

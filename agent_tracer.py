@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Agent-based tracer that emits structured JSON summaries for Gluon builtins."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+
+import anyio
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    query,
+)
+
+from config import AMD_PRE_SEMANTIC_FILES, CPP_FILES, OUTPUT_DIR, SEMANTIC_FILES
+from agent_common import (
+    MalformedAgentResponseError,
+    extract_first_json_object,
+    log_status,
+    render_text_blocks,
+)
+from structures import BuiltinOp
+
+DEFAULT_ALL_OPS_JSON = os.path.join(OUTPUT_DIR, "all_gluon_ops.json")
+
+
+@dataclass
+class TraceResult:
+    """In-memory representation of the agent response."""
+
+    gluon_op: str
+    ttgir_ops: List[str]
+    semantic: str
+    lowering_summary: str
+
+
+class TracePromptBuilder:
+    """Constructs a tracing prompt for a single builtin op."""
+
+    def __init__(
+        self,
+        semantic_files: Sequence[str],
+        cpp_files: Sequence[str],
+        amd_pre_semantic_files: Sequence[str],
+    ) -> None:
+        self.semantic_files = list(semantic_files)
+        self.cpp_files = list(cpp_files)
+        self.amd_pre_semantic_files = list(amd_pre_semantic_files)
+
+    @staticmethod
+    def _format_path_block(title: str, paths: Sequence[str]) -> str:
+        if not paths:
+            return ""
+        entries = "\n".join(f"  - {path}" for path in paths)
+        return f"{title}:\n{entries}\n"
+
+    def build_prompt(self, op: BuiltinOp) -> str:
+        analysis_goals = (
+            "Deeply trace this single Gluon builtin across the lowering stack:\n"
+            "  1. Read the Gluon definition to understand inputs/outputs.\n"
+            "  2. Follow the lowering into the semantic layers listed above.\n"
+            "     AMD-specific ops must go through AMD_PRE_SEMANTIC_FILES first.\n"
+            "  3. Inspect the builder logic inside the C++ files to understand how\n"
+            "     TTGIR ops are emitted and how operands/attributes are computed.\n"
+            "  4. Describe the TTGIR ops in execution order. Each entry should be\n"
+            "     a `dialect.operation` string (e.g., ttg.make_range).\n"
+            "  5. Summarize the semantics and lowering logic using information from\n"
+            "     the actual code—do not rely on surface summaries.\n"
+        )
+
+        output_format = (
+            "Respond with a single JSON object containing ONLY these keys:\n"
+            "{\n"
+            '  "gluon_op": "name",\n'
+            '  "ttgir_ops": ["ttg.make_range"],\n'
+            '  "semantic": "Concise semantic description",\n'
+            '  "lowering_summary": "Detailed multi-sentence explanation of how the lowering works."\n'
+            "}\n"
+            "No markdown, commentary, or additional fields are allowed.\n"
+        )
+
+        sections = [
+            "You are an expert compiler engineer.",
+            f"Builtin name: {op.name}",
+            f"Source file: {op.file_path}",
+            analysis_goals,
+            "Files you must inspect:",
+            self._format_path_block("AMD_PRE_SEMANTIC_FILES", sorted(self.amd_pre_semantic_files)),
+            self._format_path_block("SEMANTIC_FILES", self.semantic_files),
+            self._format_path_block("CPP_FILES", self.cpp_files),
+            output_format,
+        ]
+        return "\n".join(section for section in sections if section)
+
+
+class TraceResponseParser:
+    """Parses and normalizes the JSON emitted by the agent."""
+
+    def __init__(self, json_loader=json.loads):
+        self._json_loader = json_loader
+
+    def parse(self, raw_response: str, fallback_name: str) -> TraceResult:
+        if not raw_response or not raw_response.strip():
+            raise MalformedAgentResponseError("Empty response from agent")
+
+        payload = extract_first_json_object(raw_response)
+        try:
+            data = self._json_loader(payload)
+        except json.JSONDecodeError as exc:
+            raise MalformedAgentResponseError(f"Invalid JSON object: {exc}") from exc
+
+        gluon_op = str(data.get("gluon_op") or fallback_name).strip()
+        semantic = str(data.get("semantic") or f"Gluon builtin: {gluon_op}").strip()
+        lowering_summary = str(data.get("lowering_summary") or "").strip()
+        normalized_ops = self._normalize_ttgir_ops(data.get("ttgir_ops"))
+
+        return TraceResult(
+            gluon_op=gluon_op,
+            ttgir_ops=normalized_ops,
+            semantic=semantic,
+            lowering_summary=lowering_summary or "Lowering summary unavailable.",
+        )
+
+    @staticmethod
+    def _normalize_ttgir_ops(value: Any) -> List[str]:
+        if value is None:
+            return []
+
+        entries: Iterable[Any]
+        if isinstance(value, str):
+            entries = [value]
+        elif isinstance(value, dict):
+            entries = [value]
+        elif isinstance(value, Iterable):
+            entries = value
+        else:
+            raise MalformedAgentResponseError("ttgir_ops must be a list of strings")
+
+        normalized: List[str] = []
+        for entry in entries:
+            if isinstance(entry, str):
+                clean = entry.strip()
+                if clean:
+                    normalized.append(clean)
+                continue
+
+            if isinstance(entry, dict):
+                dialect = str(entry.get("dialect", "")).strip()
+                op_name = str(
+                    entry.get("operation")
+                    or entry.get("op")
+                    or entry.get("name")
+                    or entry.get("full_name", "")
+                ).strip()
+                if dialect and op_name:
+                    normalized.append(f"{dialect}.{op_name}")
+                elif op_name or dialect:
+                    normalized.append(op_name or dialect)
+                continue
+
+        return normalized
+
+
+class AgentBasedTracer:
+    """Tracer that uses Claude Agent SDK + Codex MCP to summarize a builtin."""
+
+    def __init__(
+        self,
+        prompt_builder: Optional[TracePromptBuilder] = None,
+        response_parser: Optional[TraceResponseParser] = None,
+    ) -> None:
+        prompt_builder = prompt_builder or TracePromptBuilder(
+            semantic_files=SEMANTIC_FILES,
+            cpp_files=CPP_FILES,
+            amd_pre_semantic_files=AMD_PRE_SEMANTIC_FILES,
+        )
+        self.prompt_builder = prompt_builder
+        self.response_parser = response_parser or TraceResponseParser()
+
+        self.codex_options = ClaudeAgentOptions(
+            allowed_tools=["mcp__codex", "Read", "Grep"],
+            mcp_servers={
+                "codex": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": [
+                        "-y",
+                        "@openai/codex",
+                        "-c",
+                        'model_provider="amd-openai"',
+                        "mcp-server",
+                    ],
+                }
+            },
+            system_prompt=(
+                "You are an expert compiler engineer analyzing Triton Gluon operations.\n"
+                "Your response MUST be a single valid JSON object that matches the caller's schema.\n"
+                "Do not include prose, code fences, or commentary. Use empty arrays/strings when unsure."
+            ),
+            max_turns=15,
+        )
+
+    async def trace_operation(self, op: Union[BuiltinOp, Dict[str, Any]]) -> Dict[str, Any]:
+        builtin = self._normalize_op(op)
+        prompt = self.prompt_builder.build_prompt(builtin)
+        raw_response, query_error = await self._invoke_agent(prompt, builtin.name)
+
+        try:
+            trace_result = self.response_parser.parse(raw_response, builtin.name)
+            return self._result_to_json(trace_result, builtin)
+        except MalformedAgentResponseError as exc:
+            self._log_warning(builtin.name, exc, raw_response, query_error)
+            return self._fallback_json(builtin, str(exc))
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            self._log_warning(builtin.name, exc, raw_response, query_error)
+            return self._fallback_json(builtin, "Agent tracing failed")
+
+    async def _invoke_agent(self, prompt: str, op_name: str) -> tuple[str, Optional[Exception]]:
+        response_text = ""
+        query_error: Optional[Exception] = None
+
+        try:
+            async for message in query(prompt=prompt, options=self.codex_options):
+                if isinstance(message, AssistantMessage):
+                    response_text += render_text_blocks(message.content)
+                elif isinstance(message, ResultMessage):
+                    response_text += render_text_blocks(getattr(message, "content", None))
+                    payload = getattr(message, "result", None)
+                    if payload:
+                        if isinstance(payload, str):
+                            response_text += payload
+                        else:
+                            response_text += json.dumps(payload)
+        except Exception as exc:  # pragma: no cover - guard against agent issues
+            query_error = exc
+            log_status(f"Warning: Agent streaming failed for {op_name}: {exc}")
+
+        return response_text, query_error
+
+    @staticmethod
+    def _normalize_op(op: Union[BuiltinOp, Dict[str, Any]]) -> BuiltinOp:
+        if isinstance(op, BuiltinOp):
+            return op
+
+        if isinstance(op, dict):
+            name = str(op.get("name", "unknown"))
+            file_path = str(op.get("file_path", "unknown"))
+            return BuiltinOp(name=name, file_path=file_path)
+
+        raise TypeError(f"Unsupported op type for tracing: {type(op)}")
+
+    @staticmethod
+    def _result_to_json(result: TraceResult, op: BuiltinOp) -> Dict[str, Any]:
+        clean_ops = [entry for entry in (s.strip() for s in result.ttgir_ops) if entry]
+        return {
+            "gluon_op": result.gluon_op or op.name,
+            "ttgir_ops": clean_ops,
+            "semantic": result.semantic or f"Gluon builtin: {op.name}",
+            "lowering_summary": result.lowering_summary or "Lowering summary unavailable.",
+        }
+
+    @staticmethod
+    def _fallback_json(op: BuiltinOp, reason: str) -> Dict[str, Any]:
+        return {
+            "gluon_op": op.name,
+            "ttgir_ops": [],
+            "semantic": f"Gluon builtin: {op.name}",
+            "lowering_summary": reason,
+        }
+
+    @staticmethod
+    def _log_warning(
+        op_name: str,
+        error: Exception,
+        response: Optional[str],
+        query_error: Optional[Exception],
+    ) -> None:
+        if query_error:
+            log_status(f"Warning: Agent query failed for {op_name}: {query_error}")
+        log_status(f"Warning: Failed to parse agent response for {op_name}: {error}")
+        if response:
+            snippet = response.replace("\n", " ")[:400]
+            if snippet:
+                log_status(f"Response snippet: {snippet}...")
+
+
+async def trace_builtin_with_agent(
+    op: Union[BuiltinOp, Dict[str, Any]],
+    tracer: Optional[AgentBasedTracer] = None,
+) -> Dict[str, Any]:
+    tracer = tracer or AgentBasedTracer()
+    return await tracer.trace_operation(op)
+
+
+def _load_op_from_json(
+    op_name: str,
+    json_path: str = DEFAULT_ALL_OPS_JSON,
+) -> BuiltinOp:
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(
+            f"Gluon ops file not found: {json_path}. Run the scanner to generate it."
+        )
+
+    with open(json_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    def _match(entry: Dict[str, Any]) -> Optional[BuiltinOp]:
+        if entry.get("name") == op_name:
+            return AgentBasedTracer._normalize_op(entry)
+        return None
+
+    if isinstance(payload, list):
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            candidate = _match(entry)
+            if candidate:
+                return candidate
+    elif isinstance(payload, dict):
+        candidate = _match(payload)
+        if candidate:
+            return candidate
+        for value in payload.values():
+            if isinstance(value, list):
+                for entry in value:
+                    if not isinstance(entry, dict):
+                        continue
+                    candidate = _match(entry)
+                    if candidate:
+                        return candidate
+
+    raise ValueError(f"Operation '{op_name}' not found in {json_path}")
+
+
+def _load_builtin_op(
+    op_name: str,
+    ops_file: str = DEFAULT_ALL_OPS_JSON,
+    op_file_path: Optional[str] = None,
+) -> BuiltinOp:
+    if op_file_path:
+        return BuiltinOp(name=op_name, file_path=os.path.abspath(op_file_path))
+    return _load_op_from_json(op_name, ops_file)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Trace a Gluon builtin through lowering and emit JSON summary.",
+    )
+    parser.add_argument("--op", required=True, help="Name of the Gluon op to trace.")
+    parser.add_argument(
+        "--ops-file",
+        default=DEFAULT_ALL_OPS_JSON,
+        help=(
+            "Path to the JSON file containing discovered Gluon operations. "
+            f"Defaults to {DEFAULT_ALL_OPS_JSON}."
+        ),
+    )
+    parser.add_argument(
+        "--op-file-path",
+        help=(
+            "Optional absolute path to the builtin definition. "
+            "When provided, the tracer skips the ops index and uses this path directly."
+        ),
+    )
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = _parse_args()
+
+    builtin = _load_builtin_op(
+        op_name=args.op,
+        ops_file=args.ops_file,
+        op_file_path=args.op_file_path,
+    )
+
+    log_status(f"Tracing Gluon builtin: {builtin.name} ({builtin.file_path})")
+    tracer = AgentBasedTracer()
+    result = anyio.run(tracer.trace_operation, builtin)
+    log_status("Agent trace complete.")
+
+    json.dump(result, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
