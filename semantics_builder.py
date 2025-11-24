@@ -14,7 +14,7 @@ import anyio
 
 from agent_common import log_status
 from agent_scanner import AgentBasedScanner
-from agent_tracer import AgentBasedTracer
+from agent_tracer import AgentBasedTracer, default_gluon_interface
 from config import OUTPUT_DIR
 
 DEFAULT_SEMANTICS_OUTPUT = os.path.join(OUTPUT_DIR, "all_semantics.json")
@@ -67,6 +67,10 @@ def _fallback_trace_payload(op: Any, reason: str) -> Dict[str, Any]:
         "ttgir_ops": [],
         "semantic": f"Gluon builtin: {op_name}",
         "lowering_summary": reason,
+        "gluon_op_interface": default_gluon_interface(
+            f"Interface unavailable: {reason}"
+        ),
+        "code_snippet": "",
     }
 
 

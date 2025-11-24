@@ -19,7 +19,13 @@ from claude_agent_sdk import (
     query,
 )
 
-from config import AMD_PRE_SEMANTIC_FILES, CPP_FILES, OUTPUT_DIR, SEMANTIC_FILES
+from config import (
+    ALL_GLUON_EXAMPLE_FILES,
+    AMD_PRE_SEMANTIC_FILES,
+    CPP_FILES,
+    OUTPUT_DIR,
+    SEMANTIC_FILES,
+)
 from agent_common import (
     MalformedAgentResponseError,
     extract_first_json_object,
@@ -31,6 +37,11 @@ from structures import BuiltinOp
 DEFAULT_ALL_OPS_JSON = os.path.join(OUTPUT_DIR, "all_gluon_ops.json")
 
 
+def default_gluon_interface(description: str = "") -> str:
+    """Return a default Gluon interface string."""
+    return description if description else "result = op_name(...)"
+
+
 @dataclass
 class TraceResult:
     """In-memory representation of the agent response."""
@@ -39,6 +50,8 @@ class TraceResult:
     ttgir_ops: List[str]
     semantic: str
     lowering_summary: str
+    gluon_op_interface: str
+    code_snippet: str
 
 
 class TracePromptBuilder:
@@ -49,10 +62,12 @@ class TracePromptBuilder:
         semantic_files: Sequence[str],
         cpp_files: Sequence[str],
         amd_pre_semantic_files: Sequence[str],
+        example_files: Sequence[str],
     ) -> None:
         self.semantic_files = list(semantic_files)
         self.cpp_files = list(cpp_files)
         self.amd_pre_semantic_files = list(amd_pre_semantic_files)
+        self.example_files = list(example_files)
 
     @staticmethod
     def _format_path_block(title: str, paths: Sequence[str]) -> str:
@@ -64,7 +79,14 @@ class TracePromptBuilder:
     def build_prompt(self, op: BuiltinOp) -> str:
         analysis_goals = (
             "Deeply trace this single Gluon builtin across the lowering stack:\n"
-            "  1. Read the Gluon definition to understand inputs/outputs.\n"
+            "  1. Read the builtin definition carefully and capture the COMPLETE function interface as a code string.\n"
+            "     Include every parameter exactly as written in the function signature: required args, optional args with their default values, keyword-only args, and any *args/**kwargs.\n"
+            "     If the op has BOTH a function form AND an operator syntax sugar form, include both:\n"
+            "       - Function form: result = op_name(param1, param2, param=default)\n"
+            "       - Operator form: result = x op y (e.g., result = x + y)\n"
+            "     Join them with ' OR ' if both exist (e.g., 'result = add(x, y, _semantic=None) OR result = x + y').\n"
+            "     If only one form exists, just show that form.\n"
+            "     Use this to populate `gluon_op_interface` as a simple code string.\n"
             "  2. Follow the lowering into the semantic layers listed above.\n"
             "     AMD-specific ops must go through AMD_PRE_SEMANTIC_FILES first.\n"
             "  3. Inspect the builder logic inside the C++ files to understand how\n"
@@ -73,15 +95,24 @@ class TracePromptBuilder:
             "     a `dialect.operation` string (e.g., ttg.make_range).\n"
             "  5. Summarize the semantics and lowering logic using information from\n"
             "     the actual code—do not rely on surface summaries.\n"
+            "  6. Search ONLY the ALL_GLUON_EXAMPLE_FILES listed below for the\n"
+            "     most typical real kernel usage of this builtin.\n"
+            "     Prefer examples from tutorial files over test files.\n"
+            "     Choose a snippet that shows the op in a meaningful context (5-10 lines),\n"
+            "     including relevant surrounding operations that make the usage clear.\n"
+            "     DO NOT include source file path comments or line numbers.\n"
+            "     Just provide clean, well-formatted code showing how to use the op.\n"
         )
 
         output_format = (
             "Respond with a single JSON object containing ONLY these keys:\n"
             "{\n"
             '  "gluon_op": "name",\n'
+            '  "gluon_op_interface": "result = op_name(x, y, param=default) OR result = x op y",\n'
             '  "ttgir_ops": ["ttg.make_range"],\n'
             '  "semantic": "Concise semantic description",\n'
-            '  "lowering_summary": "Detailed multi-sentence explanation of how the lowering works."\n'
+            '  "lowering_summary": "Detailed multi-sentence explanation of how the lowering works.",\n'
+            '  "code_snippet": "Clean, well-formatted code snippet from ALL_GLUON_EXAMPLE_FILES (no source comments)"\n'
             "}\n"
             "No markdown, commentary, or additional fields are allowed.\n"
         )
@@ -95,6 +126,7 @@ class TracePromptBuilder:
             self._format_path_block("AMD_PRE_SEMANTIC_FILES", sorted(self.amd_pre_semantic_files)),
             self._format_path_block("SEMANTIC_FILES", self.semantic_files),
             self._format_path_block("CPP_FILES", self.cpp_files),
+            self._format_path_block("ALL_GLUON_EXAMPLE_FILES", self.example_files),
             output_format,
         ]
         return "\n".join(section for section in sections if section)
@@ -120,12 +152,16 @@ class TraceResponseParser:
         semantic = str(data.get("semantic") or f"Gluon builtin: {gluon_op}").strip()
         lowering_summary = str(data.get("lowering_summary") or "").strip()
         normalized_ops = self._normalize_ttgir_ops(data.get("ttgir_ops"))
+        gluon_interface = self._normalize_gluon_interface(data.get("gluon_op_interface"))
+        code_snippet = self._normalize_code_snippet(data.get("code_snippet"))
 
         return TraceResult(
             gluon_op=gluon_op,
             ttgir_ops=normalized_ops,
             semantic=semantic,
             lowering_summary=lowering_summary or "Lowering summary unavailable.",
+            gluon_op_interface=gluon_interface,
+            code_snippet=code_snippet,
         )
 
     @staticmethod
@@ -167,6 +203,38 @@ class TraceResponseParser:
 
         return normalized
 
+    @staticmethod
+    def _normalize_gluon_interface(value: Any) -> str:
+        """Normalize gluon_op_interface to a simple code string."""
+        if value is None:
+            return default_gluon_interface()
+
+        if isinstance(value, str):
+            return value.strip() if value.strip() else default_gluon_interface()
+
+        # If it's a dict (old format), try to extract a description
+        if isinstance(value, dict):
+            description = str(value.get("description") or "").strip()
+            return description if description else default_gluon_interface()
+
+        # For any other type, convert to string
+        return str(value).strip() if str(value).strip() else default_gluon_interface()
+
+    @staticmethod
+    def _normalize_code_snippet(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            snippet = value.get("code") or value.get("snippet") or value.get("text")
+            if snippet:
+                return str(snippet).strip()
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            joined = "\n".join(str(item).strip() for item in value if item)
+            return joined.strip()
+        return str(value).strip()
+
 
 class AgentBasedTracer:
     """Tracer that uses Claude Agent SDK + Codex MCP to summarize a builtin."""
@@ -180,6 +248,7 @@ class AgentBasedTracer:
             semantic_files=SEMANTIC_FILES,
             cpp_files=CPP_FILES,
             amd_pre_semantic_files=AMD_PRE_SEMANTIC_FILES,
+            example_files=ALL_GLUON_EXAMPLE_FILES,
         )
         self.prompt_builder = prompt_builder
         self.response_parser = response_parser or TraceResponseParser()
@@ -204,7 +273,7 @@ class AgentBasedTracer:
                 "Your response MUST be a single valid JSON object that matches the caller's schema.\n"
                 "Do not include prose, code fences, or commentary. Use empty arrays/strings when unsure."
             ),
-            max_turns=15,
+            max_turns=30,
         )
 
     async def trace_operation(self, op: Union[BuiltinOp, Dict[str, Any]]) -> Dict[str, Any]:
@@ -264,15 +333,20 @@ class AgentBasedTracer:
             "ttgir_ops": clean_ops,
             "semantic": result.semantic or f"Gluon builtin: {op.name}",
             "lowering_summary": result.lowering_summary or "Lowering summary unavailable.",
+            "gluon_op_interface": result.gluon_op_interface or default_gluon_interface(),
+            "code_snippet": result.code_snippet or "",
         }
 
     @staticmethod
     def _fallback_json(op: BuiltinOp, reason: str) -> Dict[str, Any]:
+        interface = default_gluon_interface(f"Interface unavailable: {reason}")
         return {
             "gluon_op": op.name,
             "ttgir_ops": [],
             "semantic": f"Gluon builtin: {op.name}",
             "lowering_summary": reason,
+            "gluon_op_interface": interface,
+            "code_snippet": "",
         }
 
     @staticmethod

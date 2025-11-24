@@ -43,3 +43,42 @@ OUTPUT_DIR = "/app/TritonToGluon/outputs"
 # Agent configuration
 MAX_PARALLEL_SUBAGENTS = 10
 SUBAGENT_BATCH_SIZE = 5
+
+# Gluon Kernel Example Files
+# Tutorials & In-tree Examples
+GLUON_TUTORIAL_FILES = [
+    f"{TRITON_PATH}/python/examples/gluon/01-attention-forward.py",
+    f"{TRITON_PATH}/python/tutorials/gluon/01-intro.py",
+    f"{TRITON_PATH}/python/tutorials/gluon/02-layouts.py",
+    f"{TRITON_PATH}/python/tutorials/gluon/03-async-copy.py",
+    f"{TRITON_PATH}/python/tutorials/gluon/04-tma.py",
+    f"{TRITON_PATH}/python/tutorials/gluon/05-wgmma.py",
+    f"{TRITON_PATH}/python/tutorials/gluon/06-tcgen05.py",
+    f"{TRITON_PATH}/python/tutorials/gluon/07-persistence.py",
+    f"{TRITON_PATH}/python/tutorials/gluon/08-warp-specialization.py",
+]
+
+# AMD Reference Examples
+GLUON_AMD_EXAMPLE_FILES = [
+    f"{TRITON_PATH}/third_party/amd/python/examples/gluon/f16_fa_gfx1250.py",
+    f"{TRITON_PATH}/third_party/amd/python/examples/gluon/f16_gemm_gfx1250.py",
+    f"{TRITON_PATH}/third_party/amd/python/examples/gluon/mxfp_fa_gfx1250.py",
+    f"{TRITON_PATH}/third_party/amd/python/examples/gluon/mxfp_gemm_gfx1250.py",
+]
+
+# Tests & QA Assets
+GLUON_TEST_FILES = [
+    f"{TRITON_PATH}/python/test/gluon/test_core.py",
+    f"{TRITON_PATH}/python/test/gluon/test_consan.py",
+    f"{TRITON_PATH}/python/test/gluon/test_frontend.py",
+    f"{TRITON_PATH}/python/test/gluon/test_lowerings.py",
+    f"{TRITON_PATH}/python/test/unit/tools/test_triton_to_gluon.py",
+    f"{TRITON_PATH}/third_party/amd/python/test/test_gluon_gfx1250.py",
+]
+
+# All Gluon kernel example files combined
+ALL_GLUON_EXAMPLE_FILES = (
+    GLUON_TUTORIAL_FILES +
+    GLUON_AMD_EXAMPLE_FILES +
+    GLUON_TEST_FILES
+)
