@@ -1,0 +1,1157 @@
+[
+  {
+    "gluon_op": "add",
+    "ttgir_ops": [
+      "tt.addptr",
+      "arith.addf",
+      "arith.addi"
+    ],
+    "semantic": "add performs layout-aware, elementwise addition that supports pointer plus offset arithmetic, floating-point addition, and integer addition with optional overflow sanitization; pointer-plus-pointer is illegal.",
+    "lowering_summary": "Frontend call (gl.add(x, y) or the + operator) resolves to tl_core.add, which unwraps constexpr operands and forwards to the active _semantic. GluonSemantic.broadcast_impl_value ensures both operands are distributed tensors with compatible shapes/layouts, auto-filling missing layouts when either side uses AutoLayout. TritonSemantic.add runs dtype checks and classifies the operation: pointer arithmetic routes to builder.create_addptr, floats to builder.create_fadd, and ints to builder.create_add. For pointer cases, unsigned offsets are widened before tt.addptr to preserve positivity, and the result tensor reuses the pointer operand's type/layout. For integer cases with sanitize_overflow=True, operands are temporarily promoted to int64, the add re-executed without sanitization, and comparisons against dtype min/max guard a device_assert, after which the real arith.addi result is returned in the original dtype. Python bindings in ir.cc map these builder calls directly to MLIR ops (arith.addf, arith.addi, tt.addptr), and GluonOpBuilder inherits this behavior without overriding it.",
+    "gluon_op_interface": "result = add(x, y, sanitize_overflow=True) OR result = x + y",
+    "code_snippet": "a_val = gl.load(a_ptrs + ystride_a * yoffs[None, :], mask=mask)\nb_val = gl.load(b_ptrs + ystride_b * yoffs[None, :], mask=mask)\n\nc_val = a_val + b_val\n\ngl.store(c_ptrs + ystride_c * yoffs[None, :], c_val, mask=mask)"
+  },
+  {
+    "gluon_op": "associative_scan",
+    "ttgir_ops": [
+      "ttg.scan",
+      "ttg.scan.return"
+    ],
+    "semantic": "Applies an associative scan operation along a specified axis of the input tensor(s), combining adjacent elements using a user-defined combine function. The operation supports forward and reverse scans and can handle single tensors or tuples of tensors.",
+    "lowering_summary": "The associative_scan builtin lowers to the tt.scan TTGIR operation through a multi-stage process. The Gluon frontend wraps the standard Triton associative_scan from tl.core, which accepts an input tensor (or tuple of tensors), an axis integer, a combine_fn callback, and an optional reverse boolean. The semantic layer validates that the axis is within valid range (normalized to positive if negative) and that all input tensors share the same shape. It then invokes builder.create_scan passing the tensor handles, axis, and reverse flag, constructing a tt.scan operation with a nested region. The combine function is compiled into the scan's region via make_combine_region: this creates a new MLIR block with arguments representing pairs of scalar values (one pair per input tensor, totaling 2*N parameters where N is the number of inputs), invokes the user's JIT-compiled combine_fn on these scalars, and terminates the region with a tt.scan.return operation containing the result handles. The tt.scan operation is marked as Pure, requires SameOperandsAndResultEncoding and SameOperandsAndResultShape, and operates on a single block. During conversion to TritonGPU, the tt.scan is transformed to a ttg.scan operation preserving the region structure, axis attribute, and reverse flag. The resulting scan outputs are wrapped back into tensors with the same shape and element types as the inputs. This design allows arbitrary associative operations (sum, product, max, etc.) to be expressed via the user-provided combine function, which is inlined into the scan's region for efficient execution.",
+    "gluon_op_interface": "result = associative_scan(input, axis, combine_fn, reverse=False)",
+    "code_snippet": "@gluon.jit\ndef _combine(a, b):\n    return a + b\n\n@gluon.jit\ndef kernel(x_ptr, z_ptr, M: ttgl.constexpr, N: ttgl.constexpr, layout: ttgl.constexpr, axis: ttgl.constexpr):\n    x_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))[:, None]\n    x_offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, layout))[None, :]\n    x = ttgl.load(x_ptr + x_offs_m * N + x_offs_n)\n    y = ttgl.associative_scan(x, axis=axis, combine_fn=_combine)\n    ttgl.store(z_ptr + x_offs_m * N + x_offs_n, y)"
+  },
+  {
+    "gluon_op": "assume",
+    "ttgir_ops": [
+      "llvm.assume"
+    ],
+    "semantic": "Provides a compiler optimization hint that a condition is true, with no runtime effect.",
+    "lowering_summary": "The assume builtin accepts a condition argument which is first converted to a tensor via to_tensor, allowing scalars and constexpr values to be promoted to tensor form. The semantic layer then invokes builder.create_assume, passing the condition's IR handle. The C++ builder emits a single LLVM::AssumeOp with the condition operand. This operation provides an optimization hint to the compiler that the condition holds true without generating runtime checks or assertions. The lowering is unconditional and always produces the same LLVM assume intrinsic regardless of the condition's type or shape, relying on the LLVM backend to exploit the assumption for optimization passes.",
+    "gluon_op_interface": "assume(cond)",
+    "code_snippet": "@gluon.jit\ndef simple_ops_kernel(arg: tl.int32):\n    ttgl.assume(arg > 1)\n    ttgl.device_print(\"arg: \", arg)"
+  },
+  {
+    "gluon_op": "atomic_add",
+    "ttgir_ops": [
+      "tt.atomic_rmw"
+    ],
+    "semantic": "Performs an atomic read-modify-write addition operation on memory pointed to by pointer, adding val and storing the result atomically, returning the old value.",
+    "lowering_summary": "The atomic_add builtin delegates to the shared TritonSemantic implementation. Type checking first validates that the pointer is writable, that the value dtype is at least 16 bits, and that for non-add atomics fp16/bf16 are rejected. The val and mask operands are broadcast to match any block pointer shape, val is cast to the pointee dtype, and an all-true mask is synthesized if none is provided. The semantic layer then selects ATOMIC_OP.FADD for floating-point dtypes and ATOMIC_OP.ADD for integer dtypes, converts the sem and scope string arguments to enums (defaulting to acq_rel and gpu respectively), and invokes the builder's create_atomic_rmw. The C++ builder emits a single tt.atomic_rmw operation with the chosen RMWOp, pointer, value, mask, semantics, and scope attributes, computing the result type from the pointee dtype and preserving layout information through the Gluon tensor wrapper.",
+    "gluon_op_interface": "result = atomic_add(pointer, val, mask=None, sem=None, scope=None)",
+    "code_snippet": "ptr = ttgl.make_block_ptr(base, shape=(SIZE,), strides=(1,), offsets=(pid * BLOCK_SIZE,), block_shape=(BLOCK_SIZE,), order=(0,))\noffset = ttgl.arange(0, BLOCK_SIZE)\nval = ttgl.full((BLOCK_SIZE,), 1.0, dtype=tl.float32)\nold = ttgl.atomic_add(offset + ptr, val)\n\nmask = ttgl.arange(0, BLOCK_SIZE) < SIZE\nold_relaxed = ttgl.atomic_add(offset + ptr, val, mask=mask, sem=\"relaxed\")"
+  },
+  {
+    "gluon_op": "atomic_and",
+    "ttgir_ops": [
+      "tt.atomic_rmw"
+    ],
+    "semantic": "Atomic bitwise-AND read-modify-write on pointer operands, returning the old value.",
+    "lowering_summary": "The Gluon atomic_and builtin directly delegates to TritonSemantic's implementation without any Gluon-specific overrides. The semantic layer first validates pointer mutability and type compatibility via atom_red_typechecking_impl, ensuring integer dtypes (\u226516 bits) and rejecting floating-point operands except for add. If mask is omitted, it is materialized as an all-true tensor matching the pointer's shape. The val operand is broadcast to match pointer shape when block pointers are used. The sem and scope parameters are converted from optional string or enum values to MEM_SEMANTIC and MEM_SYNC_SCOPE enums, defaulting to acquire-release and GPU scope respectively. Finally, the semantic layer emits a single tt.atomic_rmw operation with RMWOp::AND, passing the validated pointer, value, mask, semantic, and scope attributes. For AMD buffer-based atomics, the cdna3 pre-semantic helper _buffer_atomic_rmw_impl normalizes the same parameters and calls create_buffer_atomic_rmw, which emits ttag.buffer_atomic_rmw instead. No intermediate Gluon IR nodes are introduced; the lowering produces a direct atomic operation preserving all user-specified memory ordering and scope constraints.",
+    "gluon_op_interface": "result = atomic_and(pointer, val, mask=None, sem=None, scope=None)",
+    "code_snippet": "ttgl.atomic_and(offset + ptr, val)"
+  },
+  {
+    "gluon_op": "atomic_cas",
+    "ttgir_ops": [
+      "tt.atomic_cas"
+    ],
+    "semantic": "Performs an atomic compare-and-swap operation at a memory location, returning the old value before the swap if the comparison succeeds.",
+    "lowering_summary": "The atomic_cas builtin in Gluon is a wrapper around the standard Triton atomic_cas operation. The lowering first unwraps constexpr values for sem and scope parameters, converting them to their string representations if provided. It then calls the semantic layer's atomic_cas method, which validates that the pointer element type has a bitwidth of 16, 32, or 64 (other widths raise an error). The semantic layer converts the sem string (acquire, release, acq_rel, relaxed) to the corresponding ir.MEM_SEMANTIC enum value, defaulting to ACQUIRE_RELEASE if not specified, and converts the scope string (gpu, cta, sys) to the ir.MEM_SYNC_SCOPE enum value, defaulting to GPU. It extracts the element type from the pointer to determine the result type. If the pointer is a block (tensor of pointers), the result is a tensor with the same shape as the pointer but with element type matching the pointee type; otherwise it returns a scalar of the pointee type. Finally, it emits a single tt.atomic_cas TTGIR operation with the pointer, compare value, new value, memory semantic, and synchronization scope operands.",
+    "gluon_op_interface": "result = atomic_cas(pointer, cmp, val, sem=None, scope=None)",
+    "code_snippet": "x0 = ttgl.full([1], 1, ttgl.int64, layout=ttgl.AutoLayout())\nptr0 = x0.cast(ttgl.pointer_type(ttgl.int32), bitcast=True).item()\nttgl.atomic_cas(ptr0, 0, 1)\n\nBLOCK: ttgl.constexpr = 128\nx = ttgl.full([BLOCK], 0, ttgl.int64, layout=ttgl.AutoLayout())\nptr = x.cast(ttgl.pointer_type(ttgl.int32), bitcast=True)\noffset = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\nold = ttgl.full([BLOCK], 0, ttgl.int32, layout=ttgl.AutoLayout())\nnew = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\nttgl.atomic_cas(offset + ptr, old, new, sem=\"relaxed\")\nttgl.atomic_cas(offset + ptr, old, new)"
+  },
+  {
+    "gluon_op": "atomic_max",
+    "ttgir_ops": [
+      "tt.atomic_rmw"
+    ],
+    "semantic": "Atomically computes the maximum of a memory location and a value, returning the old value. For integers, uses signed/unsigned max based on dtype signedness. For floats, implements max via bitcasting to integer and using signed max for positive values and unsigned min for negative values.",
+    "lowering_summary": "The atomic_max operation follows a dtype-based dispatch pattern. First, the semantic layer performs type checking via atom_red_typechecking_impl, which validates pointer types, casts the value to match the pointer's element type, and broadcasts the mask if needed (defaulting to true if not provided). The semantic string parameters are converted to IR enums via _str_to_sem and _str_to_scope (defaulting to acq_rel and gpu respectively). For integer types, the lowering directly emits a single tt.atomic_rmw operation with the MAX or UMAX atomic operation kind depending on whether the scalar type is signed or unsigned. For floating-point types (float32 and float64 only), the implementation bitcasts both the pointer and value to the corresponding integer types (int32/uint32 for float32, int64/uint64 for float64), then computes the sign bit of the value. It conditionally invokes tt.atomic_rmw MAX on the signed integer pointer for positive values (where max semantics apply directly to the IEEE 754 representation) and tt.atomic_rmw UMIN on the unsigned integer pointer for negative values (where the bitwise interpretation inverts the ordering), merging the results via tt.select based on the sign bit, and finally bitcasting back to the original float type. The builder's create_atomic_rmw method in ir.cc constructs an AtomicRMWOp with the computed destination type (either the pointee scalar type or a tensor thereof matching the pointer's shape), the RMWOp enum (MAX/UMAX/UMIN), and the provided ptr, val, mask, sem, and scope operands.",
+    "gluon_op_interface": "result = atomic_max(pointer, val, mask=None, sem=None, scope=None)",
+    "code_snippet": "ptr = ttgl.full([BLOCK], 0, ttgl.int64, layout=ttgl.AutoLayout()).cast(ttgl.pointer_type(ttgl.int32), bitcast=True)\nval = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\nmask = ttgl.full([BLOCK], True, ttgl.int1, layout=ttgl.AutoLayout())\noffset = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\nttgl.atomic_max(offset + ptr, val)\nttgl.atomic_max(offset + ptr, val, mask=mask)"
+  },
+  {
+    "gluon_op": "atomic_min",
+    "ttgir_ops": [
+      "tt.atomic_rmw"
+    ],
+    "semantic": "Atomically compute the minimum value between a memory location and a provided value, returning the old value from memory",
+    "lowering_summary": "The atomic_min builtin is forwarded from tl.core.atomic_min through ttgl.atomic_min (wrapped with the builtin decorator). The semantic layer (TritonSemantic.atomic_min in semantic.py) performs type checking via atom_red_typechecking_impl, which validates pointer types, element types (excluding fp16/bf16 for min, minimum 16-bit width), and broadcasts mask and value to match pointer shape if needed. The semantic converts sem and scope strings to IR enums and determines the scalar type. For signed integers, it emits a single tt.atomic_rmw operation with ATOMIC_OP.MIN; for unsigned integers, it uses ATOMIC_OP.UMIN. For floating-point types (float32/float64 only), the implementation uses a bitcast-based approach: it bitcasts the float value and pointer to signed/unsigned integer types, then conditionally executes atomic_smin for positive values (sign bit = 0) or atomic_umax for negative values (sign bit = 1), masking each operation appropriately, and finally selects and bitcasts the result back to the original float type. The C++ builder (create_atomic_rmw in ir.cc) constructs the AtomicRMWOp with the specified RMWOp kind, pointer, value, mask, memory semantic, and synchronization scope, inferring the result type from the pointer's pointee type.",
+    "gluon_op_interface": "result = atomic_min(pointer, val, mask=None, sem=None, scope=None)",
+    "code_snippet": "BLOCK: ttgl.constexpr = 128\nptr = ttgl.full([BLOCK], 0, ttgl.int64, layout=ttgl.AutoLayout()).cast(ttgl.pointer_type(ttgl.int32), bitcast=True)\nval = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\noffset = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\nttgl.atomic_min(offset + ptr, val)"
+  },
+  {
+    "gluon_op": "atomic_or",
+    "ttgir_ops": [
+      "tt.atomic_rmw"
+    ],
+    "semantic": "Bitwise OR atomic read-modify-write across scalar pointers or tensors of pointers, returning the previous memory contents while honoring optional per-lane masks and user-selectable memory semantic/scope settings.",
+    "lowering_summary": "Gluon re-exports the Triton atomic_or builtin via the builtin table, preserving the public API signature. The Triton frontend normalizes tensors and constexprs, then forwards to the semantic layer. GluonSemantic inherits TritonSemantic without overriding atomic operations, and AMD-specific logic does not intercept atomics, so the generic Triton lowering path always executes. The semantic layer's atom_red_typechecking_impl enforces pointer element-type legality, broadcasts val and mask to the pointer shape, casts val to the pointee dtype, and manufactures an all-true mask when omitted. The atomic_or semantic function parses the sem and scope parameters, then invokes the builder with ATOMIC_OP.OR, gating participation by the mask and returning the pre-update tensor. GluonOpBuilder derives from TritonOpBuilder, so the call reaches create_atomic_rmw, which constructs a tt.AtomicRMWOp carrying the OR operation code, pointer, value, mask, semantic, and scope operands. The resulting TTGIR tt.atomic_rmw operation encodes the bitwise-or semantics with the specified memory ordering and synchronization scope, enabling backend code generation for hardware-specific atomic instructions.",
+    "gluon_op_interface": "atomic_or(pointer, val, mask=None, sem=None, scope=None)",
+    "code_snippet": "BLOCK: ttgl.constexpr = 128\nx = ttgl.full([BLOCK], 0, ttgl.int64, layout=ttgl.AutoLayout())\nptr = x.cast(ttgl.pointer_type(ttgl.int32), bitcast=True)\nval = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\nmask = ttgl.full([BLOCK], True, ttgl.int1, layout=ttgl.AutoLayout())\noffset = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\nttgl.atomic_or(offset + ptr, val)"
+  },
+  {
+    "gluon_op": "atomic_xchg",
+    "ttgir_ops": [
+      "tt.atomic_rmw"
+    ],
+    "semantic": "Atomically exchange a value in memory and return the previous value. Validates pointer mutability, broadcasts val and mask to pointer block shape, enforces dtype compatibility, and defaults to acq_rel/gpu memory semantics.",
+    "lowering_summary": "The Gluon _core module re-exports triton.language.core.atomic_xchg as a builtin, so user kernels invoke it with (pointer, val, mask, sem, scope) parameters. AMD pre-semantic layers do not specialize atomic_xchg, so lowering proceeds directly to the shared semantic implementation. The semantic.py atom_red_typechecking_impl function first validates that the pointer references mutable storage and rejects unsupported element types (sub-16-bit integers, fp16/bf16 unless for add operations). It then broadcasts val and mask tensors to match the pointer's block shape, casts val to the pointee dtype, and materializes an all-true mask when none is provided. The atomic_xchg wrapper converts optional sem and scope string arguments to ir.MEM_SEMANTIC and ir.MEM_SYNC_SCOPE enumerations, defaulting to acq_rel and gpu respectively. It calls builder.create_atomic_rmw with ir.ATOMIC_OP.XCHG along with the prepared pointer, value, and mask handles. The C++ TritonOpBuilder.create_atomic_rmw method in ir.cc constructs a tt.atomic_rmw operation with rmwOp set to XCHG, deriving the result type from the pointer argument so that scalar pointers yield scalar results and blocked pointers yield matching blocked tensors containing the pre-swap memory values. This TT dialect AtomicRMWOp encodes the exchange semantic and is consumed by downstream TTGIR passes, while any helper operations for broadcasting, masking, or constant generation remain outside the invariant core operation set.",
+    "gluon_op_interface": "result = atomic_xchg(pointer, val, mask=None, sem=None, scope=None)",
+    "code_snippet": "@gluon.jit\ndef test_atomic_rmw():\n    x0 = ttgl.full([1], 1, ttgl.int64, layout=ttgl.AutoLayout())\n    ptr0 = x0.cast(ttgl.pointer_type(ttgl.int32), bitcast=True).item()\n    ttgl.atomic_xchg(ptr0, 1)"
+  },
+  {
+    "gluon_op": "atomic_xor",
+    "ttgir_ops": [
+      "tt.atomic_rmw"
+    ],
+    "semantic": "Atomically XORs val into the element referenced by pointer for each lane where mask is true, broadcasting operands to the pointer's block shape, defaulting mask to all-true when omitted, and honoring the requested memory semantics (sem) and synchronization scope (scope).",
+    "lowering_summary": "The Gluon language re-exports triton.language.core.atomic_xor through its builtin decorator so callers invoke the generic signature and automatically receive the active semantic context. The AMD ops module provides no atomic_xor override, so the generic builtin path applies uniformly. Kernels run under GluonSemantic, a subclass of TritonSemantic, which preserves distributed layout metadata before delegating to the base implementation. atom_red_typechecking_impl validates pointer, value, and mask types, broadcasts tensors and shapes, casts values to the pointee dtype, and synthesizes an all-true mask if none is supplied. atomic_xor then calls builder.create_atomic_rmw with the XOR opcode plus the user's sem and scope strings to produce the tensor result. Because GluonOpBuilder inherits TritonOpBuilder, create_atomic_rmw lowers directly to a tt.atomic_rmw operation that materializes the destination tensor type and encodes the XOR variant.",
+    "gluon_op_interface": "atomic_xor(pointer, val, mask=None, sem=None, scope=None)",
+    "code_snippet": "BLOCK = 128\nptr = x.cast(ttgl.pointer_type(ttgl.int32), bitcast=True)\nval = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\noffset = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\nttgl.atomic_xor(offset + ptr, val)"
+  },
+  {
+    "gluon_op": "broadcast",
+    "ttgir_ops": [
+      "tt.broadcast"
+    ],
+    "semantic": "Broadcasts two tensors to a common compatible shape, returning both operands expanded to match.",
+    "lowering_summary": "The broadcast operation takes two tensor operands and returns a tuple of both tensors expanded to their joint broadcasted shape. In Gluon's semantic layer, both inputs must be distributed_type block tensors with compatible layouts; if one has AutoLayout it inherits the other's layout, otherwise a layout mismatch raises an error. The implementation computes the broadcasted shape by applying NumPy-style broadcasting rules (comparing dimensions pairwise from the right, accepting equal sizes or singleton dimensions), then calls broadcast_impl_shape on each operand to expand it to the target shape. The broadcast_impl_shape helper constructs a new distributed_type with the desired shape and invokes the C++ builder create_broadcast, which emits a tt::BroadcastOp operation in TTGIR. For non-distributed tensors or scalars, the base Triton semantic handles the lowering: scalars are splatted to match block shapes, rank mismatches are resolved by inserting leading singleton dimensions via create_expand_dims, and the final expansion again uses create_broadcast. This two-stage approach (shape computation followed by IR emission) ensures both operands reach a common shape suitable for element-wise operations, with the tt::BroadcastOp materializing the expanded tensor in the IR.",
+    "gluon_op_interface": "lhs, rhs = broadcast(input, other)",
+    "code_snippet": "layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [2, 16], [4, 1], [1, 0])\na = ttgl.arange(0, 16, layout=ttgl.SliceLayout(0, layout))[None, :]\nb = ttgl.arange(0, 16, layout=ttgl.SliceLayout(1, layout))[:, None]\n0 + a + b"
+  },
+  {
+    "gluon_op": "cast",
+    "ttgir_ops": [
+      "tt.fp_to_fp",
+      "tt.bitcast",
+      "arith.si_to_fp",
+      "arith.ui_to_fp",
+      "arith.fp_to_si",
+      "arith.fp_to_ui",
+      "arith.extf",
+      "arith.truncf",
+      "arith.extsi",
+      "arith.extui",
+      "arith.trunci",
+      "tt.ptr_to_int",
+      "tt.int_to_ptr"
+    ],
+    "semantic": "Type conversion operator that transforms tensors between different numeric types (float, int, pointer) using either numeric conversion or bitwise reinterpretation",
+    "lowering_summary": "The cast operation lowers through a semantic dispatch in triton/language/semantic.py that inspects source and destination dtypes to select the appropriate conversion path. Floating-point upcasts emit arith.extf while downcasts emit arith.truncf, with optional rounding mode attributes for fp8/fp16 precision control via tt.fp_to_fp. Integer-to-float conversions produce arith.si_to_fp or arith.ui_to_fp depending on signedness, while float-to-integer uses arith.fp_to_si or arith.fp_to_ui. Integer width changes emit arith.extsi, arith.extui, or arith.trunci based on whether the cast widens or narrows and whether the source is signed. Pointer-to-integer and integer-to-pointer conversions emit tt.ptr_to_int and tt.int_to_ptr respectively, while pointer-to-pointer casts use tt.bitcast. When the bitcast parameter is True, all conversions bypass numeric semantics and emit tt.bitcast to reinterpret the bit pattern directly. Boolean conversions are handled by comparing against zero before applying the standard integer cast path. The lowering preserves tensor shapes and only transforms element types, with the builder methods in ir.cc directly instantiating the corresponding MLIR dialect operations without additional transformations.",
+    "gluon_op_interface": "result = cast(input, dtype, fp_downcast_rounding=None, bitcast=False)",
+    "code_snippet": "val = ttgl.full([BLOCK], 1, ttgl.uint32, layout=ttgl.AutoLayout())\nttgl.amd.cdna3.buffer_atomic_max(uint32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_min(uint32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_add(uint32_ptr, offsets, val)\n\nval = val.cast(ttgl.int64)\nttgl.amd.cdna3.buffer_atomic_xchg(int64_ptr, offsets, val, mask=0)"
+  },
+  {
+    "gluon_op": "device_assert",
+    "ttgir_ops": [
+      "tt.assert"
+    ],
+    "semantic": "Emits a runtime assertion that halts execution when any lane's condition is false. When a mask is provided, masked-off lanes are excluded from the check. The operation is only emitted when debug mode is enabled; otherwise it is a no-op.",
+    "lowering_summary": "Gluon re-exports the base Triton device_assert builtin without modification. At semantic lowering, the operation first checks if debugging is enabled (via builder.options.debug); if disabled, no IR is emitted. When enabled, the condition and optional mask are converted to boolean tensors. If a mask is supplied, it is inverted (via xor with all-ones) and combined with the condition using a logical or, so masked-off lanes always pass. The final predicate and string message are passed to builder.create_assert, which emits a triton::AssertOp in TTGIR carrying the message as an attribute. The core TTGIR operation is always tt.assert; the mask logic uses helper arith ops (xor, or) that are excluded as scaffolding since they only appear to pre-process the predicate.",
+    "gluon_op_interface": "device_assert(cond, msg: str = \"\", mask: Optional[tl.tensor] = None)",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "device_print",
+    "ttgir_ops": [],
+    "semantic": "Gluon builtin: device_print",
+    "lowering_summary": "No JSON object found in agent response",
+    "gluon_op_interface": "Interface unavailable: No JSON object found in agent response",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "expand_dims",
+    "ttgir_ops": [
+      "tt.expand_dims"
+    ],
+    "semantic": "Inserts a new dimension of size 1 at the specified axis in a tensor. In Gluon, the input must have a SliceLayout, AutoLayout, or CoalescedLayout, and the slice must be along the inserted axis. Scalars are promoted to splats of the new shape. The operation is zero-cost in registers, enabling broadcast-compatible shapes without data movement.",
+    "lowering_summary": "The expand_dims operation dispatches from Gluon's _core.py to the Triton core helper, which normalizes axes (sorting, deduplicating) and iterates calls to the semantic layer. Gluon's semantic layer (_semantic.py) enforces distributed tensor constraints: inputs must be SliceLayout, AutoLayout, or CoalescedLayout with the slice aligned to the insertion axis, then invokes the builder with the normalized axis and infers the result layout by unwrapping the parent encoding. Core Triton semantics (semantic.py) handle both scalars (converted to splats of the new shape) and block tensors (direct ExpandDimsOp). The IR builder (ir.cc, gluon_ir.cc) binds to tt::ExpandDimsOp with a single tensor operand and an axis attribute. Type inference inserts a unit dimension into the ranked tensor type and delegates encoding inference to the operand dialect; for GPU layouts, inferExpandDimsOpEncoding constrains operands to SliceEncodingAttr sliced at the requested axis and produces the parent layout for the result. Canonicalization folds trivial splats and sinks broadcasts, ensuring the operation remains a pure, view-like transform with no data movement.",
+    "gluon_op_interface": "result = expand_dims(input, axis)",
+    "code_snippet": "m = ttgl.reduce(row_max, 0, ttgl.maximum)\nm_bc = ttgl.expand_dims(m, 0)\nrow_max_safe = ttgl.where(row_max == -float('inf'), 0.0, row_max)\nrow_sum_safe = ttgl.where(row_sum == 0.0, 1.0, row_sum)\nmi = ttgl.reshape_1d_slice(ttgl.expand_dims(row_max_safe, 1), m_stride=0)\nsi = ttgl.reshape_1d_slice(ttgl.expand_dims(row_sum_safe, 1), m_stride=0)\nttgl.copy_1d_slice(mi, m_tensor)"
+  },
+  {
+    "gluon_op": "gather",
+    "ttgir_ops": [
+      "tt.gather"
+    ],
+    "semantic": "Gathers elements from a source tensor along a specified axis using indices from an index tensor, producing an output tensor with the same shape as the index tensor.",
+    "lowering_summary": "The gather operation lowers directly from Gluon to a single tt.gather TTGIR operation. The Gluon semantic layer performs validation ensuring the source and index tensors have matching ranks, that all non-gather dimensions have matching shapes between index and source tensors, that the index tensor has integer scalar type, and that both inputs are distributed tensors. The axis parameter is normalized if negative by adding the source rank. The operation preserves the source tensor's element type while adopting the index tensor's shape and layout for the result. At the TTGIR level, tt.gather encodes the source tensor, integer index tensor, and axis as operands, with an optional efficient_layout attribute. The LLVM lowering selects between two strategies: warp-local gather using shuffle instructions when the layout permits intra-warp computation without cross-warp data movement, or shared-memory gather that materializes the source in shared memory, synchronizes threads, then loads indexed elements. The warp-local path leverages linear layout analysis to determine which source registers map to each index value, emitting shuffle and select instructions. The shared-memory path stores source elements, issues a barrier, computes gather indices by replacing the axis dimension with loaded index values, and loads from the linearized shared memory offsets.",
+    "gluon_op_interface": "result = gather(src, index, axis)",
+    "code_snippet": "src_offs = ttgl.arange(0, src_dim, layout=src_layout)\nsrc = ttgl.load(src_ptr + src_offs)\n\nidx_offs = ttgl.arange(0, idx_dim, layout=idx_layout)\nidx = ttgl.load(idx_ptr + idx_offs)\n\nout = ttgl.gather(src, idx, axis)\n\nttgl.store(out_ptr + idx_offs, out)"
+  },
+  {
+    "gluon_op": "inline_asm_elementwise",
+    "ttgir_ops": [
+      "tt.elementwise_inline_asm"
+    ],
+    "semantic": "Executes inline assembly over tensor elements in a map-like pattern, broadcasting input arguments and applying the assembly block to packed groups of elements",
+    "lowering_summary": "The inline_asm_elementwise builtin lowers directly to the tt.elementwise_inline_asm TTGIR operation without passing through intermediate semantic layers. The lowering begins by unwrapping constexpr parameters (asm, constraints, pack, is_pure) and normalizing the dtype parameter into a sequence to handle both single and multiple output cases. All input arguments are converted to tensors via to_tensor and broadcasted to a common shape using binary_op_type_checking_impl with arithmetic_check disabled and pointer types allowed for both operands. The broadcast shape determines the result tensor shapes by pairing each output dtype with the broadcasted block shape via with_element_ty. The builder.create_inline_asm method constructs the tt.elementwise_inline_asm operation by passing the assembly string, constraint string, input tensor handles, output IR types (converted via to_ir), the pure flag, and pack count. The operation executes the inline assembly block on pack elements at a time in an unspecified order, with small elements (less than 4 bytes) packed into 4-byte registers. The result is either a single tensor wrapping the first result or a tuple of tensors for multiple outputs, each wrapping its corresponding operation result with the appropriate type.",
+    "gluon_op_interface": "result = inline_asm_elementwise(asm, constraints, args, dtype, is_pure, pack)",
+    "code_snippet": "layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])\nx = ttgl.arange(0, 16, layout)\nttgl.inline_asm_elementwise(\"mov $0, $0;\", \"=r,r\", [x], dtype=x.dtype, is_pure=True, pack=1)"
+  },
+  {
+    "gluon_op": "join",
+    "ttgir_ops": [
+      "tt.join"
+    ],
+    "semantic": "Joins two tensors by broadcasting them to the same shape, then concatenating along a new minor dimension of size 2. Scalars are temporarily promoted to rank-1 tensors.",
+    "lowering_summary": "The Gluon join op first broadcasts the two input tensors to compatible shapes, rejecting scalar inputs at the Gluon semantic layer. The core Triton semantic layer re-broadcasts the operands, handles the scalar edge case by temporarily promoting scalars to rank-1 tensors via expand_dims, then emits a single tt.join IR operation that concatenates the two SSA values along a new trailing dimension of size 2, producing an output shape [...input_shape, 2]. If the inputs were scalars, the result is reshaped back to [2]. The IR builder create_join method directly constructs a JoinOp with the two operand handles. Layout inference in Gluon wraps the returned IR value with distributed layout metadata derived from the broadcasted input layouts, ensuring layout compatibility or setting AutoLayout when operands have differing concrete layouts.",
+    "gluon_op_interface": "result = join(a, b)",
+    "code_snippet": "x0 = _join_n(xs[:len(xs) // 2])\nx1 = _join_n(xs[len(xs) // 2:])\nlayout: gl.constexpr = _get_join_n_layout(x0.type.layout)\nx = gl.join(x0, x1).permute(0, 2, 1).reshape([x0.shape[0], x0.shape[1] * 2])\nreturn gl.convert_layout(x, layout, assert_trivial=True)"
+  },
+  {
+    "gluon_op": "load",
+    "ttgir_ops": [
+      "tt.load"
+    ],
+    "semantic": "Load values from memory at the given pointer, with optional masking, boundary checking, and padding for block pointers.",
+    "lowering_summary": "The Gluon load builtin forwards directly to Triton's core load (triton/language/core.py) by wrapping it with the builtin mechanism. TritonSemantic.load inspects the pointer type: block pointers route to _load_block_pointer, which canonicalizes the boundary_check tuple, validates padding_option, and calls builder.create_tensor_pointer_load to emit a tt.load with boundary enforcement. Scalar or tensor-of-pointers route to _load_legacy, which broadcasts mask and other to match the pointer shape, casts boolean pointers to int8, and selects either builder.create_load (unmasked) or builder.create_masked_load (masked) to emit the corresponding tt.load variant. The GluonOpBuilder inherits TritonOpBuilder's create_load/create_masked_load/create_tensor_pointer_load methods, all of which construct a triton::LoadOp in C++ with the appropriate operands (pointer, mask, other) and attributes (cache_modifier, eviction_policy, volatile, boundary_check, padding_option). Thus every load lowers to a single tt.load operation, with the builder logic selecting the correct overload and attribute set based on pointer style, mask presence, and boundary/padding parameters.",
+    "gluon_op_interface": "load(pointer, mask=None, other=None, boundary_check=(), padding_option=\"\", cache_modifier=\"\", eviction_policy=\"\", volatile=False)",
+    "code_snippet": "@gluon.jit\ndef copy_scalar_kernel(in_ptr, out_ptr):\n    value = gl.load(in_ptr)\n    gl.store(out_ptr, value)"
+  },
+  {
+    "gluon_op": "map_elementwise",
+    "ttgir_ops": [
+      "tt.map_elementwise",
+      "tt.map_elementwise.return"
+    ],
+    "semantic": "Broadcasts all input tensors to a common shape and layout, then applies a scalar function element-wise by building a nested region with pack scalar arguments per tensor and returning scalar results.",
+    "lowering_summary": "The Gluon semantic layer first broadcasts all input tensors using layout-aware broadcasting that enforces identical ranks, harmonizes singleton dimensions, and ensures compatible distributed layouts by materializing auto layouts when necessary. It then clones the first input's block layout while substituting each scalar result's dtype. The frontend collects each input tensor's scalar element type, constructs a new MLIR block with pack scalar arguments per input, calls the user-provided JIT scalar function inside this block, and terminates the region with tt.map_elementwise.return carrying the scalar outputs. Finally, the semantic builder emits a single tt.map_elementwise operation with the pack attribute, the broadcasted tensor operands, and the attached region; each result handle is wrapped as a tensor with the inferred element type and cloned layout. Because GluonOpBuilder inherits TritonOpBuilder, the C++ layer directly constructs the standard Triton dialect operations without Gluon-specific transformations.",
+    "gluon_op_interface": "result = map_elementwise(scalar_fn, *args, pack=1)",
+    "code_snippet": "@gluon.jit\ndef _apply_causal_mask(qk, col_limit_right):\n    offs_n = gl.arange(0, qk.shape[1])[None, :]\n    s = offs_n & ~0xf\n    i = offs_n & 0xf\n    return gl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)"
+  },
+  {
+    "gluon_op": "max_constancy",
+    "ttgir_ops": [],
+    "semantic": "Annotates a tensor with constancy metadata specifying that each group of N consecutive elements along each dimension is constant, enabling downstream optimizations for vectorization and async copies.",
+    "lowering_summary": "The max_constancy builtin does not emit new TTGIR operations; instead, it attaches a tt.constancy attribute to the existing SSA value representing the input tensor. The user provides a constexpr integer or list of constexpr integers specifying the constancy period along each dimension. The frontend validates that each element is a constexpr[int], normalizes the input to a Python list of integers, and verifies the list length matches the tensor rank. The semantic layer then constructs a DenseIntElementsAttr from the integer list and invokes set_attr on the MLIR value handle to attach the tt.constancy attribute. The C++ binding routes this through the MLIR attribute API, storing the metadata either on the defining operation or, for block arguments, on the parent operation with an argument-index suffix. No additional TTGIR ops such as constants, conversions, or reshapes are generated; the attribute remains as metadata for downstream compiler passes that analyze data movement patterns, vectorization legality, and async copy scheduling.",
+    "gluon_op_interface": "result = max_constancy(input, values)",
+    "code_snippet": "smem = ttgl.allocate_shared_memory(inp.dtype.element_ty, [XBLOCK], ttgl.SwizzledSharedLayout(1, 1, 1, order=[0]))\nblock_layout: ttgl.constexpr = ttgl.BlockedLayout([2], [32], [4], [0])\nxindex = ttgl.arange(0, XBLOCK, block_layout)\nmask = ttgl.max_constancy(xindex < xnumel, 2)\n\nasync_copy.async_copy_global_to_shared(smem, inp + xindex)\nasync_copy.async_copy_global_to_shared(smem, inp + xindex, mask, cache_modifier=\".ca\", eviction_policy=\"evict_last\",\n                                       volatile=True)"
+  },
+  {
+    "gluon_op": "max_contiguous",
+    "ttgir_ops": [],
+    "semantic": "Adds a `tt.contiguity` metadata attribute to the tensor or block-pointer SSA value so compiler analyses can rely on per-dimension contiguous spans without recomputing them.",
+    "lowering_summary": "The Gluon `max_contiguous` builtin is aliased to the stock Triton API in _core.py and uses the inherited TritonSemantic implementation. The semantic layer enforces that the length of the `values` list matches the tensor rank, then constructs a DenseIntElementsAttr<i32> via `ir.make_attr` and attaches it to the SSA value using `handle.set_attr(\"tt.contiguity\", attr)`. The C++ binding for `set_attr` adds the attribute to the defining operation or, if the value is a block argument, to the parent operation. No new TTGIR operations are emitted; the existing value simply gains a `tt.contiguity` metadata tag that downstream passes such as AxisInfo, layout inference, and async copy planners can query to optimize memory access patterns. The GluonOpBuilder inherits TritonOpBuilder without altering this attribute mechanism, so the lowering is transparent in Gluon kernels.",
+    "gluon_op_interface": "result = max_contiguous(input, values)",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "maximum",
+    "ttgir_ops": [
+      "arith.maxsi",
+      "arith.maxui",
+      "arith.maximumf",
+      "arith.maxnumf"
+    ],
+    "semantic": "Element-wise maximum of two tensors with configurable NaN propagation for floating-point types",
+    "lowering_summary": "The maximum builtin promotes bfloat16 inputs to float32, broadcasts operands to a common shape, then dispatches based on element dtype. Floating-point inputs select between arith.maximumf (when propagate_nan requests torch.maximum semantics, propagating NaNs) and arith.maxnumf (default torch.fmax semantics, treating NaN as missing). Signed integer inputs emit arith.maxsi, unsigned integers emit arith.maxui. The semantic layer in triton/language/semantic.py inspects the propagate_nan constexpr flag and calls the corresponding builder method, which directly maps to the appropriate TTGIR arith dialect operation in ir.cc. No AMD-specific pre-semantic handling exists, so all backends follow the same lowering path through the shared TritonOpBuilder.",
+    "gluon_op_interface": "result = maximum(x, y, propagate_nan=PropagateNan.NONE)",
+    "code_snippet": "qk = _subtiled_qk_load(config, s_tmem)\n\nif STAGE == 2:\n    col_limit_right = (offs_m - start_n + 1)[:, None]\n    qk = _apply_causal_mask(qk, col_limit_right)\n\nm_ij = gl.maximum(m_i, gl.max(qk, 1) * config.qk_scale)\nalpha = gl.exp2(m_i - m_ij)"
+  },
+  {
+    "gluon_op": "minimum",
+    "ttgir_ops": [
+      "arith.minimumf",
+      "arith.minnumf",
+      "arith.minsi",
+      "arith.minui"
+    ],
+    "semantic": "Elementwise minimum of two tensors; for floats, propagate_nan controls NaN handling (ALL propagates NaNs, NONE suppresses them); for integers, uses signed or unsigned min based on dtype.",
+    "lowering_summary": "The Gluon minimum builtin delegates to the Triton language core minimum, which first promotes operands to tensor form and upgrades bfloat16 to float32. The semantic layer validates shape and dtype compatibility, then branches on dtype and the propagate_nan flag: floating-point types emit arith.minimumf when propagate_nan is ALL (NaNs propagate) or arith.minnumf when NONE (NaNs are suppressed, behaving like fmin); signed integer types emit arith.minsi and unsigned integers emit arith.minui. The builder hooks in gluon_ir.cc and ir.cc directly instantiate the corresponding MLIR arith dialect operations, with no AMD-specific overrides, making the lowering uniform across backends.",
+    "gluon_op_interface": "result = minimum(x, y, propagate_nan: constexpr = PropagateNan.NONE)",
+    "code_snippet": "@filecheck_test\n@gluon.jit\ndef test_elementwise_core():\n    layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])\n    x = ttgl.arange(0, 16, layout)\n    y = ttgl.arange(16, 32, layout)\n    a = ttgl.where(x > 8, x, y)\n    b = ttgl.maximum(x, y)\n    c = ttgl.minimum(x, y)"
+  },
+  {
+    "gluon_op": "mul",
+    "ttgir_ops": [
+      "arith.mulf",
+      "arith.muli"
+    ],
+    "semantic": "Element-wise multiplication with dtype coercion, layout-aware broadcasting, and optional integer overflow sanitization",
+    "lowering_summary": "The mul builtin first performs type checking and layout-aware broadcasting via binary_op_type_checking_impl, which coerces scalars to tensors, computes a common dtype, and ensures compatible distributed layouts through GluonSemantic.broadcast_impl_value. After broadcasting, TritonSemantic.mul inspects the scalar dtype: floating-point tensors emit arith.mulf via create_fmul, while integer tensors emit arith.muli via create_mul. When sanitize_overflow is True and the integer dtype is less than 64 bits, the operands are widened to int64, multiplied, clamped, and checked against the original bounds with a device_assert before narrowing back. The builder calls route through GluonOpBuilder to the C++ ir.cc implementation, which constructs the final MLIR ops with verifier-checked types and attributes.",
+    "gluon_op_interface": "result = mul(x, y, sanitize_overflow=True) OR result = x * y",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "multiple_of",
+    "ttgir_ops": [],
+    "semantic": "A pure compiler hint that attaches divisibility metadata to a tensor or pointer without emitting new operations.",
+    "lowering_summary": "Gluon re-exports the Triton builtin without modification. The call bypasses AMD pre-semantic files and flows into the base TritonSemantic.multiple_of implementation. After validating that the hint list length matches the tensor rank, the function calls x.handle.set_attr to attach a tt.divisibility attribute encoded as a DenseIntElementsAttr. Because the handle refers to an existing SSA value (operation result or block argument), no new TTGIR operations are emitted; instead the producing operation or function parameter is annotated in-place with {tt.divisibility = ...} metadata. This attribute propagates through the IR to inform downstream optimizations about alignment and divisibility assumptions.",
+    "gluon_op_interface": "multiple_of(input, values)",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "num_programs",
+    "ttgir_ops": [
+      "tt.get_num_programs"
+    ],
+    "semantic": "Returns the number of program instances launched along the specified grid dimension (axis \u2208 {0,1,2}) as an int32 scalar.",
+    "lowering_summary": "The num_programs builtin is a thin wrapper over Triton's core num_programs operation, with no Gluon-specific transformations. The semantic layer validates that axis is in {0,1,2}, then calls builder.create_get_num_programs(axis) to emit a single tt.GetNumProgramsOp with a ProgramDim attribute corresponding to the requested axis. This op returns an i32 scalar representing the grid dimension size. There is no dtype specialization, no broadcasting, and no auxiliary masking or conversion logic\u2014the operation is purely a query of the program grid configuration established at kernel launch. The AMD pre-semantic layer does not intercept or modify this builtin, so NVIDIA and AMD paths emit identical TTGIR. The operation's simplicity means the lowering is essentially a direct semantic-to-IR mapping with attribute passthrough.",
+    "gluon_op_interface": "result = gl.num_programs(axis)",
+    "code_snippet": "class PersistentTileScheduler:\n    def initialize(self):\n        self.num_tiles_total = gl.load(self.num_tiles_ptr)\n        self.num_programs_total = gl.num_programs(axis=0)\n        self.num_tiles_per_program = tl.cdiv(self.num_tiles_total, self.num_programs_total)\n\nclass GroupedPersistentTileSchedulerImpl:\n    def get_num_tiles(self):\n        return tl.cdiv(self.num_tiles_total, gl.num_programs(axis=0))\n\n    def get_tile(self):\n        return self.tile_id * gl.num_programs(axis=0) + gl.program_id(axis=0)"
+  },
+  {
+    "gluon_op": "permute",
+    "ttgir_ops": [
+      "tt.trans",
+      "ttg.memdesc_trans"
+    ],
+    "semantic": "Permute reorders tensor dimensions by applying a permutation of axis indices, validated to be a complete bijection of the rank. For shared-memory descriptors, both logical shape and allocation shape metadata are permuted.",
+    "lowering_summary": "The Gluon permute builtin aliases Triton's core permute, which first validates that the user-supplied dimension tuple is a complete permutation matching the tensor rank. TritonSemantic constructs a new block type with the permuted shape and emits a single tt.trans operation via create_trans, passing the SSA value and the order attribute. GluonSemantic wraps this result to track the distributed layout metadata through the permutation. For shared-memory descriptors, memdesc_trans validates the integer order list, permutes both the logical and allocation shapes, and emits ttg.memdesc_trans to produce a new descriptor handle with updated encoding. No auxiliary type conversions, bounds checks, or constants are injected; the lowering yields exactly one core TTGIR operation per call.",
+    "gluon_op_interface": "result = permute(tensor, *dims) OR result = tensor.permute(*dims) OR result = shared_memory_descriptor.permute(order)",
+    "code_snippet": "x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()\nx = gl.join(x0, x1).permute(0, 2, 1).reshape([x0.shape[0], x0.shape[1] * 2])\n\ntcgen05_mma(q0_smem, k_smem.permute((1, 0)), s0_tmem, use_acc=False, mbarriers=[s0_bar])\ntcgen05_mma(q1_smem, k_smem.permute((1, 0)), s1_tmem, use_acc=False, mbarriers=[s1_bar, k_bar])"
+  },
+  {
+    "gluon_op": "program_id",
+    "ttgir_ops": [
+      "tt.get_program_id"
+    ],
+    "semantic": "Returns the current program instance ID along the specified grid axis (0, 1, or 2) as an int32 scalar.",
+    "lowering_summary": "The Gluon program_id builtin is a direct wrapper around the core Triton program_id. When a kernel author calls program_id(axis), the Gluon decorator injects a GluonSemantic instance which inherits TritonSemantic's program_id implementation. This validates the axis is in range [0,2], then delegates to the GluonOpBuilder (which inherits from TritonOpBuilder without overriding this method). The builder emits a single tt.get_program_id operation, passing the axis as a tt.program_dim attribute. The op returns an i32 scalar SSA value representing the thread-block index along the chosen grid dimension. No type conversions, masks, or helper ops are involved; the lowering is a straightforward one-to-one mapping from the Gluon call to the TTGIR intrinsic.",
+    "gluon_op_interface": "pid = program_id(axis)",
+    "code_snippet": "@gluon.jit\ndef memcpy_kernel(in_ptr, out_ptr, xnumel, XBLOCK: gl.constexpr):\n    pid = gl.program_id(0)\n    start = pid * XBLOCK\n    end = min(start + XBLOCK, xnumel)\n    for i in range(start, end):\n        value = gl.load(in_ptr + i)\n        gl.store(out_ptr + i, value)"
+  },
+  {
+    "gluon_op": "reduce",
+    "ttgir_ops": [
+      "tt.reduce",
+      "tt.reduce.return"
+    ],
+    "semantic": "Applies a user-defined binary combine function pairwise across a specified axis, removing that dimension from the result shape unless keep_dims is True.",
+    "lowering_summary": "The reduce builtin first validates that all input tensors share the same distributed layout and normalizes the axis parameter. It constructs a TTGIR region by duplicating each input's scalar type to form two parameter groups (lhs and rhs chunks), then invokes the user's combine_fn via the JIT generator to populate the region body. The region terminates with tt.reduce.return whose operands are the values returned by combine_fn. The semantic layer enforces that axis=None triggers a non-reordering reshape to preserve layouts, validates axis bounds, and wraps results with layout inference to maintain distributed metadata. When keep_dims=True, the frontend automatically calls expand_dims to reinsert the reduced axes. The core TTGIR ops emitted are tt.reduce (with the user-defined combine region embedded) and tt.reduce.return (terminating that region), enabling downstream analysis to reconstruct the original Gluon reduction by inspecting the axis attribute, operand layouts, and region contents.",
+    "gluon_op_interface": "result = reduce(input, axis, combine_fn, keep_dims=False)",
+    "code_snippet": "y = ttgl.reduce(x, axis=axis, combine_fn=combine_fn)\nif epilogue_kind == \"reduce1d\":\n    if axis == 0:\n        z_offs = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, layout))\n    else:\n        z_offs = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))\n    ttgl.store(z_ptr + z_offs, y)\nelif epilogue_kind == \"reduce2d\":\n    y = ttgl.reduce(y, axis=0, combine_fn=combine_fn)\n    ttgl.store(z_ptr, y)"
+  },
+  {
+    "gluon_op": "reshape",
+    "ttgir_ops": [
+      "tt.reshape",
+      "ttg.memdesc_reshape"
+    ],
+    "semantic": "Reshape reinterprets a tensor to a new shape with the same element count, preserving layout order when can_reorder is False (required in Gluon).",
+    "lowering_summary": "A Gluon kernel invokes reshape as a builtin alias of the Triton language core reshape. The Triton front end normalizes variadic or tuple shape arguments and forwards to the Gluon semantic layer. Gluon semantics enforce can_reorder must be False to preserve distributed layout metadata, then delegate to the base Triton semantic implementation which validates the element count remains unchanged and constructs a new block type with the destination shape. The builder emits tt.reshape in TTIR for normal tensors, threading the shape vector and allowReorder attribute. When reshaping shared-memory descriptors Gluon provides ttg.memdesc_reshape to rewrite descriptor shapes after element count verification. No AMD-specific pre-semantic customization exists so both vendors share the same lowering chain from Gluon through Triton semantics to the IR builder.",
+    "gluon_op_interface": "result = reshape(input, *shape, can_reorder=False)",
+    "code_snippet": "x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()\nx0 = gl.convert_layout(x0, layout, assert_trivial=True)\nx1 = gl.convert_layout(x1, layout, assert_trivial=True)"
+  },
+  {
+    "gluon_op": "split",
+    "ttgir_ops": [
+      "triton.split"
+    ],
+    "semantic": "Splits a tensor along its last dimension, which must have size 2, into two tensors of identical shape with that dimension removed; returns a tuple of two tensors.",
+    "lowering_summary": "The user calls gl.split(x) or x.split() on a tensor whose final dimension has size 2. The builtin wrapper forwards the call to GluonSemantic.split, which delegates to TritonSemantic.split. The base semantic layer asserts rank \u2265 1 and final extent == 2, then computes the result block type by dropping the last dimension from the operand shape. It emits builder.create_split(a.handle), which clones the operand type but removes the trailing dimension and wraps the encoding in ttg::SliceEncodingAttr(dim=rank-1, parentEncoding=original_encoding). The builder creates a single triton::SplitOp that consumes the operand SSA value and yields two SSA results, each with the derived slice type. Gluon wraps those results back into ttgl.tensor objects and queries the updated layouts from the builder to preserve distributed encoding metadata. No AMD-specific lowering or additional helper ops are inserted; the semantic behavior is uniform across targets, with layout differences captured solely in the operand and result encodings.",
+    "gluon_op_interface": "result0, result1 = split(a) OR result0, result1 = a.split()",
+    "code_snippet": "@gluon.jit\ndef _split_n(x, SUBTILE_FACTOR: gl.constexpr):\n    split_count: gl.constexpr = SUBTILE_FACTOR.bit_length() - 1\n    xs = (x, )\n    for _ in gl.static_range(split_count):\n        next_xs = ()\n        for j in gl.static_range(len(xs)):\n            x = xs[j]\n            next_xs += x.reshape(x.shape[0], 2, x.shape[1] // 2).permute(0, 2, 1).split()\n        xs = next_xs\n    return xs"
+  },
+  {
+    "gluon_op": "static_assert",
+    "ttgir_ops": [],
+    "semantic": "Compile-time assertion that evaluates a constant boolean condition and halts compilation with an optional message if the condition is false. No runtime IR is emitted.",
+    "lowering_summary": "The static_assert builtin is intercepted by the Python code generator during AST traversal and never reaches the semantic or builder layers. When the compiler visits a static_assert call, it evaluates the condition argument at compile time, verifies it is a boolean constant, and raises a CompileTimeAssertionFailure exception if the condition is false, optionally including the user-provided message string. If the condition is true, the call is simply discarded and no TTIR or TTGIR operations are emitted. This mechanism allows kernel authors to enforce compile-time constraints on constexpr parameters, tensor shapes, and layout properties, ensuring invalid kernel configurations are rejected before any backend code generation occurs.",
+    "gluon_op_interface": "static_assert(cond, msg=\"\")",
+    "code_snippet": "def shared_memory_permute_kernel():\n    layout: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])\n    smem = ttgl.allocate_shared_memory(ttgl.float16, [4, 128], layout)\n    perm = smem.permute((1, 0))\n    ttgl.static_assert(perm.layout == ttgl.SwizzledSharedLayout(1, 1, 1, [0, 1]))"
+  },
+  {
+    "gluon_op": "static_print",
+    "ttgir_ops": [],
+    "semantic": "Compile-time host-side print that evaluates all arguments as constexprs and executes Python's print function during AST lowering, producing no runtime IR.",
+    "lowering_summary": "The static_print builtin is handled entirely during compile-time AST-to-TTIR lowering and never reaches the semantic layer or C++ builders. When the CodeGenerator encounters a call to static_print, it forces all arguments and keyword arguments to be constexprs, then immediately invokes the host Python print function to display the message during compilation. Because the operation completes at compile time on the host, no AMD pre-semantic processing occurs, no Gluon or Triton semantic method is invoked, and no TTGIR operations are emitted. The return value is a constexpr placeholder that allows the AST to remain valid, but the actual effect\u2014printing to the terminal\u2014happens solely during the JIT compilation phase, leaving the generated IR completely unchanged. This compile-time execution model distinguishes static_print from runtime device_print, which does emit TTGIR operations for on-device output.",
+    "gluon_op_interface": "static_print(*values, sep=\" \", end=\"\\n\", file=None, flush=False)",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "store",
+    "ttgir_ops": [
+      "ttg.local_store"
+    ],
+    "semantic": "Copies a register-resident distributed tensor into the shared-memory tile referenced by the descriptor; enforces exact shape and dtype match between value and descriptor.",
+    "lowering_summary": "The Gluon store builtin is defined as a method on shared-memory descriptor objects in _core.py and routes to _semantic.shared_store. The semantic layer validates that the value is a Gluon tensor with shape and dtype exactly matching the descriptor's metadata. Once validation passes, it calls the builder's create_local_store method without any layout conversions or mask generation, since the descriptor already encodes the mapping from registers to shared memory. The GluonOpBuilder in gluon_ir.cc then emits a single ttg::LocalStoreOp with the descriptor handle and value handle as operands. No AMD-specific pre-semantic interception exists for store, and no auxiliary operations such as type conversions, bounds checks, or constant materialization are part of the core semantic path\u2014the builder directly materializes the store operation based on the descriptor's layout information.",
+    "gluon_op_interface": "shared_memory_descriptor.store(value)",
+    "code_snippet": "acc_reg_layout = get_tmem_reg_layout(d_desc.dtype, (M, N), acc_tmem_layout, num_warps)\nacc = c_smem.load(acc_reg_layout)\nacc_tmem.store(acc)\n\nlhs_reg_layout = get_tmem_reg_layout(a_desc.dtype, (M, K), lhs_tmem_layout, num_warps)\nlhs = a_smem.load(lhs_reg_layout)\nlhs_tmem.store(lhs)"
+  },
+  {
+    "gluon_op": "sub",
+    "ttgir_ops": [
+      "arith.subf",
+      "arith.subi",
+      "tt.addptr"
+    ],
+    "semantic": "Subtraction of two tensors: for floating-point operands emits arith.subf, for integer operands emits arith.subi with optional overflow sanitization, for pointer minus offset rewrites as pointer addition with negated offset using tt.addptr",
+    "lowering_summary": "The Gluon sub builtin wraps the Triton semantic sub operation, first passing arguments through GluonSemantic which handles layout alignment and broadcasting to ensure operands have compatible shapes. The TritonSemantic.sub method then performs type checking via binary_op_type_checking_impl, which promotes scalars, verifies pointer arithmetic legality (allowing pointer on left-hand side only), and broadcasts operands. Based on the resulting scalar dtype, the lowering diverges: if the left operand is a pointer, subtraction is rewritten as pointer addition with a negated offset, recursively calling minus to negate the right operand and then invoking add to emit tt.addptr; if the operands are floating-point, create_fsub directly emits arith.subf; if the operands are integer, create_sub emits arith.subi, optionally wrapping it with overflow checks when sanitize_overflow is true. The core decision logic hinges on dtype inspection (pointer vs float vs int) and the sanitize_overflow flag, with no AMD-specific overrides in the pre-semantic layer, so the lowering always follows the canonical Triton semantic path into MLIR builder calls that instantiate the corresponding arithmetic dialect operations.",
+    "gluon_op_interface": "result = sub(x, y, sanitize_overflow: constexpr = True) OR result = x - y",
+    "code_snippet": "if STAGE == 2:\n    col_limit_right = (offs_m - start_n + 1)[:, None]\n    qk = _apply_causal_mask(qk, col_limit_right)\n\nm_ij = gl.maximum(m_i, gl.max(qk, 1) * config.qk_scale)\nalpha = gl.exp2(m_i - m_ij)"
+  },
+  {
+    "gluon_op": "to_tensor",
+    "ttgir_ops": [
+      "arith.constant"
+    ],
+    "semantic": "Converts a Python scalar (bool, int, float) or constexpr to a Triton tensor by materializing the appropriate constant value.",
+    "lowering_summary": "The to_tensor builtin is a thin wrapper around TritonSemantic.to_tensor that converts Python scalars into Triton tensors. When given a bool, it creates an int1 constant via builder.get_int1. For Python int values, it infers the smallest fitting signed or unsigned integer dtype and calls scalar_constant, which dispatches to the corresponding builder factory (get_int32, get_uint32, etc.). For Python float, it chooses float32 or float64 based on the exponent range and similarly invokes the builder. All of these builder methods ultimately emit arith.constant operations in TTGIR. Existing tensors pass through unchanged, and constexpr values are unwrapped recursively. GluonSemantic inherits this behavior without override, and there is no AMD-specific pre-semantic transformation for to_tensor, so the lowering path is identical to standard Triton.",
+    "gluon_op_interface": "result = to_tensor(x)",
+    "code_snippet": "@gluon.must_use_result\n@gluon.jit\ndef increment(self):\n    if self.num_barriers == 1:\n        return BarrierCounter(gl.to_tensor(0), self.phase ^ 1, self.num_barriers)\n    next_index = self.index + 1\n    rollover = next_index == self.num_barriers\n    index = gl.where(rollover, 0, next_index)\n    phase = gl.where(rollover, self.phase ^ 1, self.phase)\n    return BarrierCounter(index, phase, self.num_barriers)"
+  },
+  {
+    "gluon_op": "where",
+    "ttgir_ops": [
+      "arith.select"
+    ],
+    "semantic": "Selects elements from x or y based on a boolean condition tensor",
+    "lowering_summary": "The where builtin is forwarded from Triton's core library and follows the base semantic path. The lowering first casts the condition to int1 (with a warning if the input is not already boolean), then type-checks and broadcasts x and y to a common shape and dtype. Finally, the builder emits a single arith.select operation that takes the condition, true-value (x), and false-value (y) handles and returns the element-wise selection result. No AMD-specific override exists, so all architectures use this uniform path. The operation is a direct one-to-one mapping to MLIR's arith.select primitive, with all type coercion and broadcasting resolved before IR emission.",
+    "gluon_op_interface": "result = where(condition, x, y)",
+    "code_snippet": "@gluon.jit\ndef _mask_scalar(qk, col_limit_right, s, i):\n    col_lim_right_s = col_limit_right - s\n    col_lim_right_cur = max(col_lim_right_s, 0)\n    mask = -1 << col_lim_right_cur\n    mask_i_bit = (mask & (1 << i)) == 0\n    return gl.where(mask_i_bit, qk, -float(\"inf\"))"
+  },
+  {
+    "gluon_op": "shared_memory_descriptor.load",
+    "ttgir_ops": [
+      "ttg.local_load"
+    ],
+    "semantic": "Loads data from a shared memory descriptor into a distributed tensor with the specified layout",
+    "lowering_summary": "The shared_memory_descriptor.load operation lowers directly to a single ttg.local_load operation. The semantic layer validates that the target layout is a DistributedLayout, constructs a distributed_type with the memory descriptor's element type, shape, and the user-provided layout, then invokes the builder to emit ttg.local_load with the result type and memory descriptor handle. The TTGIR operation takes a memory descriptor operand (with SharedEncoding) and produces a tensor result (with the target DistributedLayout encoding). During LLVM lowering, the operation computes a linear layout transformation from the shared memory layout to the register layout, determining per-thread memory access patterns. The builder generates load instructions (ld.shared on NVIDIA, ds_read on AMD) that read elements from shared memory addresses into thread-local registers according to the layout transformation, properly handling multi-dimensional indexing, vectorization opportunities, and potential bank conflict patterns inherent in the layout pair.",
+    "gluon_op_interface": "result = shared_memory_descriptor.load(layout)",
+    "code_snippet": "smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])\nsmem = gl.allocate_shared_memory(gl.float32, [XBLOCK], layout=smem_layout)\ncp.async_copy_global_to_shared(smem, in_ptr + offsets, mask=mask)\ncp.commit_group()\ncp.wait_group(0)\nvalue = smem.load(layout)\ngl.store(out_ptr + offsets, value, mask=mask)"
+  },
+  {
+    "gluon_op": "shared_memory_descriptor.store",
+    "ttgir_ops": [
+      "ttg.local_store"
+    ],
+    "semantic": "Stores the provided distributed tensor into the shared-memory tile described by the descriptor after confirming the tensor argument exists and matches the descriptor's dtype and shape.",
+    "lowering_summary": "User code calls `store(value)` on the descriptor, which forwards to `GluonSemantic.shared_store`. That semantic routine enforces tensor/shape/dtype equality and then emits `builder.create_local_store(mem_desc.handle, value.handle)` with no AMD-specific override present. The semantic object inherits Triton's base semantic layer, so its builder is the `GluonOpBuilder` supplied via `TritonSemantic`. On the C++ side, `GluonOpBuilder.create_local_store` instantiates `ttg::LocalStoreOp` with the tensor and memdesc handles, and the underlying `TritonOpBuilder` binding provides the MLIR insertion-point plumbing so the op is materialized in the module. This deterministic path yields a single TTGIR op `ttg.local_store` implementing the store semantics.",
+    "gluon_op_interface": "store(value)",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "shared_memory_descriptor.slice",
+    "ttgir_ops": [
+      "ttg.memdesc_subslice"
+    ],
+    "semantic": "Slices a shared-memory descriptor along a specified dimension by setting an offset and new logical shape, producing a view into the same underlying allocation.",
+    "lowering_summary": "The slice method on shared_memory_descriptor accepts start offset, length, and dimension index (defaulting to 0). The semantic layer validates that all arguments are Python integers, then constructs an offsets vector with the start value placed at the specified dimension axis while other axes remain zero. It updates the logical shape to the new length along the sliced dimension and preserves the original dtype and shared-layout metadata, including the physical allocation shape. The Gluon C++ builder materializes a new ttg::MemDescType with the updated shape and calls create_memdesc_subslice, which emits a single ttg::MemDescSubsliceOp. This operation produces a new memory descriptor that references the same shared-memory allocation but with the computed offset and reduced shape, enabling subsequent load and store operations to work on the narrowed window without additional transformations or copies.",
+    "gluon_op_interface": "result = shared_memory_descriptor.slice(start, length, dim=0)",
+    "code_snippet": "smem = ttgl.allocate_shared_memory(ttgl.int32, [M, N], smem_layout)\nsmem_slice0 = smem.slice(SLICE_M_OFFSET, SLICE_M, dim=0)\nsmem_slice1 = smem_slice0.slice(SLICE_N_OFFSET, SLICE_N, dim=1)\nsmem.store(in_data)\nout_data = smem_slice1.load(blocked)"
+  },
+  {
+    "gluon_op": "shared_memory_descriptor.index",
+    "ttgir_ops": [
+      "ttg.memdesc_index"
+    ],
+    "semantic": "Indexes into a shared memory descriptor by dropping the leading dimension and preserving the SharedLayout, producing a new memdesc with reduced shape.",
+    "lowering_summary": "The Gluon shared_memory_descriptor.index operation accepts an integer index (constexpr or dynamic) and lowers through _semantic.memdesc_index, which first converts the index to an int32 scalar tensor, then constructs a new memdesc type by dropping the leading dimension from the input descriptor's shape while preserving its SharedLayout and setting alloc_shape to the reduced shape. The C++ builder (create_memdesc_index in gluon_ir.cc) emits a single ttg.memdesc_index operation that produces the new descriptor handle. This operation is hardware-agnostic with no AMD-specific variants, enabling multi-buffered shared memory access patterns where kernels dynamically select one buffer from an array of descriptors using modulo arithmetic on pipeline counters.",
+    "gluon_op_interface": "result = descriptor.index(index)",
+    "code_snippet": "@gluon.jit\ndef issue_loads(..., a_smem, b_smem, ..., num_buffers: gl.constexpr):\n    yoffs = copy_idx * YBLOCK + y_idx\n    mask = xmask & (yoffs < ynumel)[None, :]\n    cp.async_copy_global_to_shared(a_smem.index(copy_idx % num_buffers),\n                                   a_ptrs + ystride_a * yoffs[None, :], mask)\n    cp.async_copy_global_to_shared(b_smem.index(copy_idx % num_buffers),\n                                   b_ptrs + ystride_b * yoffs[None, :], mask)\n    cp.commit_group()"
+  },
+  {
+    "gluon_op": "shared_memory_descriptor.permute",
+    "ttgir_ops": [
+      "ttg.memdesc_trans"
+    ],
+    "semantic": "Pure metadata transformation that permutes the logical dimension order of a shared memory descriptor without moving data.",
+    "lowering_summary": "The permute method unwraps constexpr arguments in the order list and dispatches to the semantic layer's memdesc_trans helper. The semantic validates that order is a list of Python integers matching the descriptor rank, computes the permuted logical shape and allocation shape (permuting only the rank-sized tail suffix), and calls the builder to emit a single ttg.memdesc_trans operation. The builder constructs a MemDescTransOp SSA instruction with the source memdesc operand and a DenseI32ArrayAttr encoding the permutation order. The operation is a pure metadata view with no data movement; it implements TransposeOpInterface and type inference permutes both the shape and encoding attributes while preserving element type, memory space, and mutability. Folding removes identity permutations and merges chained transposes. The result descriptor reuses the same underlying shared memory allocation but presents a logically transposed view to subsequent operations. No AMD-specific overrides exist; all targets follow this generic path.",
+    "gluon_op_interface": "result = shared_memory_descriptor.permute(order)",
+    "code_snippet": "a_smem = gl.allocate_shared_memory(\n    shape=(BLOCK_M, BLOCK_K),\n    dtype=tl.float16,\n    layout=swizzle_layout_a,\n)\nb_smem = gl.allocate_shared_memory(\n    shape=(BLOCK_N, BLOCK_K),\n    dtype=tl.float16,\n    layout=swizzle_layout_b,\n)\nif do_transpose_b:\n    b = b_smem.permute((1, 0))\nelse:\n    b = b_smem"
+  },
+  {
+    "gluon_op": "shared_memory_descriptor.reshape",
+    "ttgir_ops": [
+      "ttg.memdesc_reshape"
+    ],
+    "semantic": "Reshapes a shared-memory descriptor by updating its logical shape while preserving the total element count and reusing the existing CTA and stride prefix from the original allocation.",
+    "lowering_summary": "The reshape builtin unwraps the user-provided shape sequence from constexpr wrappers and validates that each dimension is an integer. It then verifies that the product of the new shape matches the product of the old logical shape to ensure element-count preservation. The semantic layer constructs a new allocation shape by concatenating the original CTA and stride prefix with the requested logical shape, then calls the C++ builder's create_memdesc_reshape method. The builder emits a single ttg.memdesc_reshape operation that transforms the input memdesc type to the output memdesc type with the updated shape, while preserving the shared-memory layout attribute recovered from the original descriptor. This design allows kernels to reinterpret the same underlying allocation with different tensor dimensions without re-allocating, and the layout consistency ensures subsequent loads and stores remain correct.",
+    "gluon_op_interface": "result = shared_memory_descriptor.reshape(shape)",
+    "code_snippet": "layout_b: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=64, transposed=False, element_bitwidth=16,\n                                                  rank=4, cta_order=[3, 2, 1, 0])\nsmem = ttgl.allocate_shared_memory(ttgl.float16, [32, 1, 4, 64], layout_b)\nsmem.reshape((128, 64))\n\nsmem._reinterpret(ttgl.int8, [1024], ttgl.SwizzledSharedLayout(1, 1, 1, [0, 1]))"
+  },
+  {
+    "gluon_op": "shared_memory_descriptor._reinterpret",
+    "ttgir_ops": [
+      "ttg.memdesc_reinterpret"
+    ],
+    "semantic": "Reinterprets an existing shared-memory descriptor as the same allocation but with caller-provided dtype, logical shape, and SharedLayout; the call only mutates descriptor metadata (no data movement) and is only valid for contiguous sources.",
+    "lowering_summary": "The builtin unwraps constexpr arguments and forwards them to the semantic layer's memdesc_reinterpret function, which validates that the inputs are a dtype, integer list for shape, and SharedLayout instance. The semantic function constructs a new shared_memory_descriptor_type using the provided metadata while preserving the underlying allocation shape bookkeeping. It then calls the C++ builder's create_memdesc_reinterpret method, which emits a single ttg.memdesc_reinterpret TTGIR operation that retags the descriptor handle with the new type metadata without moving or reallocating data. The TTGIR op enforces that the source descriptor must be contiguous, ensuring the reinterpretation is safe. This lowering path is uniform across all targets since AMD-specific pre-semantic files provide no override for this operation.",
+    "gluon_op_interface": "shared_memory_descriptor._reinterpret(dtype, shape, layout)",
+    "code_snippet": "@gluon.jit\ndef _borrow_s_as_p(config, s_tmem):\n    p_tmem = s_tmem.slice(0, config.BLOCK_N // 2)\n    return p_tmem._reinterpret(config.dtype, config.qk_shape, config.p_tmem_layout)"
+  },
+  {
+    "gluon_op": "shared_memory_descriptor._keep_alive",
+    "ttgir_ops": [
+      "ttg.local_dealloc"
+    ],
+    "semantic": "Explicitly marks the end of a shared-memory descriptor's lifetime to prevent dead-code elimination of the allocation even when no stores/loads reference it.",
+    "lowering_summary": "The _keep_alive method on shared_memory_descriptor delegates to _semantic.shared_dealloc, which invokes the GluonOpBuilder to emit a single ttg.local_dealloc operation. This operation takes the descriptor handle as its operand and signals to the compiler that the shared-memory allocation may be deallocated, ensuring the allocation is not optimized away. There is no AMD-specific override and no additional lowering in the classic Triton semantic layer; the builtin is Gluon-exclusive and maps directly to the TTGIR deallocation primitive with no conditional logic or type specialization.",
+    "gluon_op_interface": "desc._keep_alive()",
+    "code_snippet": "if isinstance(self.mem, gl.shared_memory_descriptor):\n    self.mem._keep_alive()"
+  },
+  {
+    "gluon_op": "arange",
+    "ttgir_ops": [
+      "tt.make_range"
+    ],
+    "semantic": "Creates a 1D int32 tensor containing the range [start, end) with specified distributed layout",
+    "lowering_summary": "The arange builtin unwraps its compile-time integer start and end arguments and delegates to GluonSemantic.arange, which constructs a distributed block type with int32 dtype, shape [end - start], and either the user-supplied layout or AutoLayout if none is provided. The semantic layer enforces that start and end are constexpr ints fitting in 32 bits, that end > start, and that the range length is a power of two, raising ValueError otherwise. It then converts the distributed type to MLIR by calling distributed_type.to_ir, which wraps the element type and layout encoding into a RankedTensorType via builder.get_distributed_ty. Finally, builder.create_make_range emits a single tt.make_range operation carrying the distributed tensor type, producing the range values ready for Gluon-specific layout passes. No AMD-specific override exists, so this lowering is uniform across targets.",
+    "gluon_op_interface": "result = arange(start, end, layout=None)",
+    "code_snippet": "@gluon.jit\ndef memcpy_2d_kernel(..., layout: gl.constexpr, XBLOCK: gl.constexpr, YBLOCK: gl.constexpr):\n    ...\n    start_x = pid_x * XBLOCK\n    start_y = pid_y * YBLOCK\n    indices_x = start_x + gl.arange(0, XBLOCK, layout=gl.SliceLayout(dim=1, parent=layout))\n    indices_y = start_y + gl.arange(0, YBLOCK, layout=gl.SliceLayout(dim=0, parent=layout))\n    in_offsets = xstride_in * indices_x[:, None] + ystride_in * indices_y[None, :]\n    out_offsets = xstride_out * indices_x[:, None] + ystride_out * indices_y[None, :]"
+  },
+  {
+    "gluon_op": "convert_layout",
+    "ttgir_ops": [
+      "ttg.convert_layout"
+    ],
+    "semantic": "Transforms a distributed tensor to a new layout descriptor without changing dtype or shape; optionally asserts the conversion requires no data movement.",
+    "lowering_summary": "The convert_layout builtin validates that the input value is a distributed tensor and that the target is a DistributedLayout, then constructs a new distributed tensor type with the requested layout. If assert_trivial is True, the semantic layer queries the C++ builder's is_convert_layout_trivial helper, which compares the source and target linear layout encodings and rejects the call unless the conversion involves no dimension permutations beyond register-level reordering. When validation passes, the builder emits a single ttg.convert_layout operation that carries the input value and the new ranked tensor type attribute. No backend-specific preprocessing or additional TTGIR ops are involved; the entire lowering is a type check followed by the conversion op emission.",
+    "gluon_op_interface": "result = convert_layout(value, layout, assert_trivial=False)",
+    "code_snippet": "@gluon.jit\ndef _split_n(x, SPLIT_FACTOR: gl.constexpr = 2):\n    if SPLIT_FACTOR == 1:\n        return (x, )\n    else:\n        layout: gl.constexpr = _get_split_n_layout(x.type.layout)\n        x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()\n        x0 = gl.convert_layout(x0, layout, assert_trivial=True)\n        x1 = gl.convert_layout(x1, layout, assert_trivial=True)\n        return _split_n(x0, SPLIT_FACTOR // 2) + _split_n(x1, SPLIT_FACTOR // 2)"
+  },
+  {
+    "gluon_op": "full",
+    "ttgir_ops": [
+      "tt.splat"
+    ],
+    "semantic": "Creates a distributed tensor of the given shape and layout, filled with a scalar value.",
+    "lowering_summary": "The Gluon full builtin lowers through a two-step semantic chain: first, the fill value is coerced to the target dtype via make_scalar, producing either a scalar constant or a size-1 tensor; second, the layout parameter defaults to AutoLayout if omitted, and the semantic layer delegates to splat, which constructs a ttgl.distributed_type with the requested block shape and distributed layout encoding, then calls the builder's create_splat method. In the C++ builder, the distributed_type's to_ir method translates the Gluon layout metadata into an MLIR RankedTensorType carrying the appropriate TritonGPU or Gluon encoding attribute, and the final TTGIR instruction is a single tt.splat operation that broadcasts the scalar value across every element of the block tensor. No additional core operations appear; optional helpers for constant materialization or type promotion may be emitted but are not part of the invariant semantic signature.",
+    "gluon_op_interface": "result = full(shape, value, dtype, layout=None)",
+    "code_snippet": "m_i = gl.full([config.SPLIT_M], -float(\"inf\"), gl.float32, qk_slice_dim1)\nl_i = gl.full([config.SPLIT_M], 0.0, gl.float32, gl.SliceLayout(1, sum_layout))"
+  },
+  {
+    "gluon_op": "histogram",
+    "ttgir_ops": [
+      "triton.histogram"
+    ],
+    "semantic": "Computes a histogram of a 1-D integer tensor, counting occurrences of each value in [0, num_bins), returning an int32 tensor of counts",
+    "lowering_summary": "The histogram builtin validates that the input is a 1-D integer tensor and optionally broadcasts a boolean mask to the input shape. It then delegates directly to the C++ builder which emits a single triton.HistogramOp. The builder constructs a result type of shape [num_bins] with i32 elements, attaching the user-specified layout attribute (Gluon path) or defaulting to unspecified layout (base Triton path). The HistogramOp takes the input tensor and optional mask operand; no other TTGIR operations are generated around it. The semantic layer enforces that num_bins defines the output dimension and that the operation produces int32 counts, enabling reverse inference: any triton.HistogramOp in TTGIR directly corresponds to a histogram call with the bin count read from the result type shape and the mask presence determined by operand arity.",
+    "gluon_op_interface": "result = histogram(input, num_bins, mask=None, layout=None)",
+    "code_snippet": "@gluon.jit\ndef kernel(x_ptr, z_ptr, M: ttgl.constexpr, B: ttgl.constexpr, src_layout: ttgl.constexpr,\n           dst_layout: ttgl.constexpr):\n    offs = ttgl.arange(0, M, layout=src_layout)\n    x = ttgl.load(x_ptr + offs)\n    h = ttgl.histogram(x, B, layout=dst_layout)\n    z_offs = ttgl.arange(0, B, layout=dst_layout)\n    ttgl.store(z_ptr + z_offs, h)"
+  },
+  {
+    "gluon_op": "allocate_shared_memory",
+    "ttgir_ops": [
+      "ttg.local_alloc"
+    ],
+    "semantic": "Allocates a shared-memory buffer with the specified element type, logical shape, and layout, returning a memory descriptor; optionally initializes from a distributed tensor.",
+    "lowering_summary": "The allocate_shared_memory builtin unwraps constexpr arguments for dtype, shape, and layout, then delegates to GluonSemantic.allocate_shared, which constructs a shared_memory_descriptor_type and calls builder.create_local_alloc. If an initial value tensor is provided, its SSA value becomes the src operand of the LocalAllocOp, copying the distributed tensor into shared memory upon allocation; otherwise the buffer is uninitialized. The builder emits a single ttg.local_alloc operation producing a ttg::MemDescType tied to the shared memory space, recording both the user-visible logical shape and the physical allocation shape determined by the layout's swizzling and banking parameters. Subsequent descriptor methods such as load, store, slice, index, permute, and reshape lower to corresponding ttg.local_load, ttg.local_store, and memdesc view operations (subslice, index, trans, reshape, reinterpret), with no additional intermediate transforms\u2014each semantic call directly emits the matching TTGIR primitive after type and layout validation.",
+    "gluon_op_interface": "descriptor = allocate_shared_memory(element_ty, shape, layout, value=None)",
+    "code_snippet": "smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])\nsmem = gl.allocate_shared_memory(gl.float32, [XBLOCK], layout=smem_layout)\n\ncp.async_copy_global_to_shared(smem, in_ptr + offsets, mask=mask)\ncp.commit_group()"
+  },
+  {
+    "gluon_op": "set_auto_layout",
+    "ttgir_ops": [
+      "gluon.set_auto_layout"
+    ],
+    "semantic": "Converts a tensor with AutoLayout to a specified DistributedLayout, enabling explicit layout control for operations that require concrete layouts.",
+    "lowering_summary": "The semantic layer validates that the input tensor carries AutoLayout and the target is a DistributedLayout, then calls GluonOpBuilder.create_set_auto_layout to emit a gluon.set_auto_layout operation with the layout attribute produced by DistributedLayout._to_ir. The op enforces identical shape and element type while swapping the tensor encoding from AutoEncodingAttr to the specified concrete encoding. During the GluonResolveAutoEncodings pass, these ops seed layout inference for tensors still carrying AutoLayout and are subsequently erased once type inference completes, meaning set_auto_layout acts purely as a compile-time layout annotation with no runtime instruction emitted. The semantic layer also automatically inserts set_auto_layout when operations such as broadcast mix auto and concrete layouts to ensure operands agree before computation.",
+    "gluon_op_interface": "set_auto_layout(value, layout)",
+    "code_snippet": "a_tile = ttgl.load(ttgl.set_auto_layout(a_ptrs, block_layout_a))\nb_tile = ttgl.load(ttgl.set_auto_layout(b_ptrs, block_layout_b))"
+  },
+  {
+    "gluon_op": "fp4_to_fp",
+    "ttgir_ops": [
+      "ttg.fp4_to_fp"
+    ],
+    "semantic": "Upcast a tensor from fp4 (e2m1) packed as i8 to a floating-point type (fp16 or bf16), doubling the size along a specified axis.",
+    "lowering_summary": "The fp4_to_fp builtin converts fp4 values packed in int8 tensors to full-precision floating-point types. The user provides a source tensor (i8), a target element type (fp16 or bf16), and an axis along which unpacking occurs. The Gluon semantic layer invokes builder.create_fp4_to_fp, which emits a single ttg.Fp4ToFpOp operation in the C++ builder (gluon_ir.cc). This TTGIR op expects the source to be a ranked tensor of i8 elements and produces a result tensor with shape doubled along the specified axis dimension. The builder infers the output encoding from the input encoding using forward inference through the DialectInferLayoutInterface, ensuring layout compatibility between packed and unpacked representations. The core semantic is element-wise unpacking: each i8 element contains two fp4 values (lower 4 bits and upper 4 bits), which are extracted and converted to the target floating-point type. The TTGIR op carries the axis attribute to specify which dimension doubles in size. Later lowering passes (e.g., to LLVM) use inline PTX assembly on NVIDIA or specialized AMD code to unpack the fp4 elements into fp16/bf16 pairs, applying bit manipulation to extract mantissa and exponent fields and handle the e2m1 floating-point format.",
+    "gluon_op_interface": "result = fp4_to_fp(src, elem_type, axis)",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "warp_specialize",
+    "ttgir_ops": [
+      "ttg.warp_specialize",
+      "ttg.warp_specialize.partitions",
+      "ttg.warp_yield",
+      "ttg.warp_return"
+    ],
+    "semantic": "Partitions work across multiple warp groups by executing a default function first and zero or more worker functions in parallel, each with dedicated warp counts and register budgets.",
+    "lowering_summary": "The lowering first type-checks each (callable, args) tuple and separates the default partition from worker partitions. It emits the default region into a temporary block that terminates with ttg.warp_yield, capturing the result types. The compiler then creates a ttg.warp_specialize operation with explicit captures and per-partition warp counts, attaching requested register budgets as attributes. It materializes a ttg.warp_specialize.partitions operation whose regions are populated by invoking each worker function under a context that enforces the specified worker_num_warps[i], with each region terminated by ttg.warp_return. The default region yields values that become the operation's return values, enabling tuple unpacking for kernel authors. This structure allows the backend to schedule distinct warp groups with different resource allocations, enabling pipelined or specialized execution patterns.",
+    "gluon_op_interface": "result = warp_specialize(functions_and_args, worker_num_warps, worker_num_regs)",
+    "code_snippet": "default, producer, consumer = gl.warp_specialize(\n    [(ws_default, (data,)), (ws_producer, (data,)), (ws_consumer, (data,))],\n    worker_num_warps=[1, 1],\n    worker_num_regs=[24, 24],\n)\ngl.barrier(data)\nttgl.store(out_ptr, default + producer + consumer, mask=pid < 128)"
+  },
+  {
+    "gluon_op": "num_warps",
+    "ttgir_ops": [],
+    "semantic": "Returns the compile-time constant number of warps for the current execution context as a ttgl.constexpr, sourced from module attributes or warp-specialization partition metadata.",
+    "lowering_summary": "The num_warps builtin does not emit dedicated TTGIR operations; it queries the current warp count from GluonCallerContext if executing within a warp-specialized partition, otherwise from the builder's global options, and materializes the result as a ttgl.constexpr. During module setup, the compiler stamps the ttg.num-warps attribute onto the TTGIR module or function. When warp-specialization is active, the semantic layer creates ttg::WarpSpecializeOp regions with per-partition partitionNumWarps metadata and injects a GluonCallerContext for each worker, so num_warps() inside a partition yields the partition-specific count instead of the global default. Downstream passes retrieve the warp count via lookupNumWarps, which walks the IR hierarchy to find either the module-level attribute or the partition override. The builtin thus serves as a metadata accessor rather than an operation emitter, and any uses of the returned constexpr appear as ordinary arith.constant ops when the value is consumed.",
+    "gluon_op_interface": "result = num_warps()",
+    "code_snippet": "with ttgl.warp_specialize([1, 2, 8]) as worker:\n    ttgl.log(f\"num_warps: {ttgl.num_warps()}\")\n    if worker == 0:\n        ttgl.log(\"worker 0\")\n    elif worker == 1:\n        ttgl.log(\"worker 1\")\n    elif worker == 2:\n        ttgl.log(\"worker 2\")"
+  },
+  {
+    "gluon_op": "num_ctas",
+    "ttgir_ops": [
+      "arith.constant"
+    ],
+    "semantic": "Returns a compile-time constant integer representing the number of CTAs (cooperative thread arrays) configured for the kernel launch.",
+    "lowering_summary": "The num_ctas builtin retrieves the cluster size from the JIT launch configuration and returns it as a ttgl.constexpr value. At the semantic layer, GluonSemantic.num_ctas accesses builder.options.num_ctas, which is populated during code generation from the kernel's launch parameters. When this constexpr is materialized during IR generation, it becomes an arith.constant 32-bit integer operation via the builder's get_int32 method. No Triton or TritonGPU operations are emitted; the value is purely a compile-time constant derived from launch metadata. The builtin provides kernel code with visibility into the configured CTA count without requiring runtime queries, enabling compile-time decisions based on cluster shape.",
+    "gluon_op_interface": "result = num_ctas()",
+    "code_snippet": "@gluon.jit\ndef print_num_ctas():\n    num_ctas: ttgl.constexpr = ttgl.num_ctas()\n    print(\"num_ctas\", num_ctas)"
+  },
+  {
+    "gluon_op": "thread_barrier",
+    "ttgir_ops": [
+      "gpu.barrier"
+    ],
+    "semantic": "Synchronizes all threads in the CTA by emitting a GPU barrier operation.",
+    "lowering_summary": "The thread_barrier builtin is a parameter-less synchronization primitive that forwards to the semantic layer's debug_barrier method. The semantic implementation invokes the builder's create_barrier helper, which directly emits an mlir::gpu::BarrierOp with no operands or results. This operation represents a CTA-wide barrier that ensures all threads reach the synchronization point before any proceed. No dtype checks, broadcasting, or specialization branches are required\u2014the operation is invariant and always maps to a single gpu.barrier instruction.",
+    "gluon_op_interface": "ttgl.thread_barrier()",
+    "code_snippet": "@filecheck_test\n@gluon.jit\ndef test_barrier():\n    # CHECK: gpu.barrier\n    ttgl.thread_barrier()"
+  },
+  {
+    "gluon_op": "bank_conflicts",
+    "ttgir_ops": [],
+    "semantic": "Queries the number of shared memory bank conflicts that would occur when storing a distributed tensor layout to a shared memory layout, returning an integer computed from the layouts' linear transforms.",
+    "lowering_summary": "The bank_conflicts builtin validates that the first argument is a distributed_type and the second is a shared_memory_descriptor_type, enforcing matching shapes, dtypes, and prohibiting subsliced shared memory descriptors. The semantic layer extracts the layout attributes from both constexpr layout objects using their _to_ir methods. The builder binding then reconstructs linear layouts from these attributes and invokes the C++ function ttg::bankConflictsMemDesc with the register layout, shared memory layout, and element bitwidth to compute the bank conflict count. This is a pure metadata query that returns an integer without emitting any TTGIR operations, as the calculation is performed entirely within the C++ builder infrastructure rather than generating MLIR code.",
+    "gluon_op_interface": "result = ttgl.bank_conflicts(distr_ty, shared_ty)",
+    "code_snippet": "@gluon.jit\ndef kernel(reg_type: ttgl.constexpr, shared_type: ttgl.constexpr, ref_conflicts: ttgl.constexpr):\n    conflicts: ttgl.constexpr = ttgl.bank_conflicts(reg_type, shared_type)\n    ttgl.static_assert(conflicts == ref_conflicts)\nrun_parser(kernel, args=args, target=AMPERE_TARGET)"
+  },
+  {
+    "gluon_op": "to_linear_layout",
+    "ttgir_ops": [],
+    "semantic": "Converts a Gluon layout object to its canonical linear layout representation",
+    "lowering_summary": "The to_linear_layout builtin performs a compile-time conversion of any DistributedLayout or SharedLayout into its canonical DistributedLinearLayout representation. At the Python semantic layer, it first checks if the input is already an AutoLayout or DistributedLinearLayout, in which case it returns the layout unchanged as a constexpr. Otherwise, it invokes the C++ builder method which calls ttg::toLinearLayout to compute the linear layout representation for the given shape and layout attribute. The resulting LinearEncodingAttr is then converted back to a Python DistributedLinearLayout object via layoutToGluon helper, extracting the register, lane, warp, and block bases along with output dimension sizes. This operation is purely compile-time; it emits no TTGIR operations but instead computes and returns layout metadata as a constexpr value that can be used for static assertions and layout reasoning within Gluon kernels.",
+    "gluon_op_interface": "result = to_linear_layout(layout, shape)",
+    "code_snippet": "@gluon.jit\ndef kernel(layout: ttgl.constexpr, expected: ttgl.constexpr, shape: ttgl.constexpr):\n    computed: ttgl.constexpr = ttgl.to_linear_layout(layout, shape)\n    ttgl.static_assert(computed == expected)"
+  },
+  {
+    "gluon_op": "dot_fma",
+    "ttgir_ops": [
+      "tt.dot"
+    ],
+    "semantic": "Fused multiply-accumulate matrix multiplication: computes acc = a @ b + acc",
+    "lowering_summary": "The dot_fma builtin enforces layout constraints requiring operand a and b to use DotOperandLayout with operand indices 0 and 1 respectively, both sharing the same parent BlockedLayout as the accumulator. After validation, it delegates to TritonSemantic.dot which performs dtype compatibility checks, supporting int8, fp16, bfloat16, fp32, fp64, and fp8 variants, with automatic upcasting for deprecated fp8 types on incompatible architectures. The semantic layer validates 2D tensor shapes, enforces minimum MMA tile size constraints from the target's codegen functions, and determines the output scalar type based on input dtypes and the out_dtype parameter. It resolves input_precision from builder options when unspecified and computes max_num_imprecise_acc for fp8 operations, defaulting to 0 for other types. If no accumulator is provided, it creates a zero-initialized splat; otherwise it validates the accumulator's shape and dtype match the expected output type. Finally, it emits a single tt.dot operation through builder.create_dot, passing the validated left-hand-side and right-hand-side handles, accumulator handle, input precision setting, and max imprecise accumulator count, which materializes as a tt::DotOp in MLIR with the accumulator's type as the result type.",
+    "gluon_op_interface": "result = dot_fma(a, b, acc)",
+    "code_snippet": "a = ttgl.convert_layout(ttgl.load(a_ptr + offs), lhs_layout)\nb = ttgl.convert_layout(ttgl.load(b_ptr + offs), rhs_layout)\nc = ttgl.load(c_ptr + offs)\nout = ttgl.dot_fma(a, b, c)\nttgl.store(out_ptr + offs, out)"
+  },
+  {
+    "gluon_op": "umulhi",
+    "ttgir_ops": [
+      "tt.mulhiui"
+    ],
+    "semantic": "Computes the most significant N bits of the 2N-bit product of two unsigned integers",
+    "lowering_summary": "The umulhi operation performs dtype validation to ensure inputs are int32, int64, uint32, or uint64. Both operands are converted to tensors via the semantic layer's to_tensor method. Binary type legalization is applied to ensure type compatibility between the operands, potentially inserting casts if the types differ but are compatible. Finally, the builder emits a single tt.mulhiui TTGIR operation with the two legalized operands, producing a result of the same type as the first operand. The tt.mulhiui operation is marked as elementwise and computes the upper N bits of the 2N-bit product for each element pair.",
+    "gluon_op_interface": "result = umulhi(x, y)",
+    "code_snippet": "d = ttgl.full([16, 16], 1, ttgl.int32, layout)\ne = ttgl.full([16, 16], 1, ttgl.int32, layout)\nttgl.umulhi(d, e)"
+  },
+  {
+    "gluon_op": "exp",
+    "ttgir_ops": [
+      "math.exp"
+    ],
+    "semantic": "Compute the exponential (e^x) element-wise on a tensor or scalar.",
+    "lowering_summary": "The Gluon exp builtin is an alias of triton.language.math.exp, which materializes its operand through GluonSemantic.to_tensor to produce a distributed tensor handle, then invokes GluonOpBuilder.create_exp. This builder method is inherited from TritonOpBuilder and directly emits a single math.exp operation in TTGIR with no intermediate helper ops. The result handle is wrapped back into a ttgl.tensor preserving distributed layout metadata. No AMD-specific pre-semantic hooks intervene, so the lowering is a straightforward pass-through from the Gluon builtin to the MLIR math dialect exponential operation.",
+    "gluon_op_interface": "result = exp(x)",
+    "code_snippet": "@gluon.jit\ndef math_kernel():\n    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\n    a = ttgl.full([16, 16], 1, ttgl.float32, layout)\n    b = ttgl.full([16, 16], 2, ttgl.float32, layout)\n    c = ttgl.full([16, 16], 4, ttgl.float32, layout)\n    d = ttgl.full([16, 16], 1, ttgl.int32, layout)\n    e = ttgl.full([16, 16], 1, ttgl.int32, layout)\n    ttgl.umulhi(d, e)\n    ttgl.exp(a)\n    ttgl.exp2(a)"
+  },
+  {
+    "gluon_op": "exp2",
+    "ttgir_ops": [
+      "math.exp2"
+    ],
+    "semantic": "Computes the element-wise exponential (base 2) of input tensor x, where each element is transformed as 2^x. Only accepts fp32/fp64 tensors.",
+    "lowering_summary": "The exp2 builtin is a thin wrapper around triton.language.math.exp2, which validates the input dtype (fp32/fp64 only), converts the input to a tensor via the semantic layer, and directly calls builder.create_exp2 on the tensor handle. GluonSemantic inherits from TritonSemantic without overriding any exp2-related logic, so both Gluon and standard Triton use the identical TritonOpBuilder::create_exp2 implementation. This builder method emits a single math.exp2 operation into TTIR. During TTIR-to-TTGIR conversion, the GenericOpPattern clones the math.exp2 op while annotating its tensor types with TritonGPU encodings (e.g., #ttg.blocked) and partition attributes, producing the final TTGIR form. No AMD-specific or Gluon-specific transformations exist for exp2; the operation remains a straightforward elementwise math primitive throughout the lowering stack.",
+    "gluon_op_interface": "result = exp2(x) OR result = x.exp2()",
+    "code_snippet": "def _compute_and_store_exp2(config, qk, p_tmem):\n    SIZE: gl.constexpr = p_tmem.shape[1] // config.SPLIT_EXP_FACTOR\n    qks = _split_n(qk, config.SPLIT_EXP_FACTOR)\n    ps = ()\n    for i in gl.static_range(config.SPLIT_EXP_FACTOR):\n        p = gl.exp2(qks[i])\n        p_tmem.slice(i * SIZE, SIZE).store(p.to(config.dtype))\n        ps = ps + (p, )\n    return _join_n(ps)"
+  },
+  {
+    "gluon_op": "fma",
+    "ttgir_ops": [
+      "math.fma"
+    ],
+    "semantic": "Fused multiply-add operation computing x * y + z in a single operation",
+    "lowering_summary": "The fma builtin is wired from triton.language.math.fma through the builtin decorator, which automatically supplies the _semantic parameter when invoked under @gluon.jit. The semantic layer first converts all three operands (x, y, z) to tensors via _semantic.to_tensor, then applies binary_op_type_legalization from triton.language.core to unify dtypes and promote scalars, ensuring all three operands share a common computation type through TritonSemantic.computation_type_impl. GluonSemantic overrides the broadcasting behavior to preserve distributed layouts and wraps the resulting handle back into a ttgl.tensor with layout inferred from the builder, preventing incompatible layout mixing unless AutoLayout resolution is possible. The builder for fma is a GluonOpBuilder subclass that inherits the generic create_fma method, which directly emits a single math.fma TTGIR operation with the three legalized operands. AMD targets follow the same generic lowering path without any AMD-specific customization hooks, as confirmed by the absence of fma handling in the AMD-specific ops file.",
+    "gluon_op_interface": "result = fma(x, y, z)",
+    "code_snippet": "layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\na = ttgl.full([16, 16], 1, ttgl.float32, layout)\nb = ttgl.full([16, 16], 2, ttgl.float32, layout)\nc = ttgl.full([16, 16], 4, ttgl.float32, layout)\n\nttgl.fma(a, b, c)"
+  },
+  {
+    "gluon_op": "log",
+    "ttgir_ops": [
+      "math.log"
+    ],
+    "semantic": "Computes the natural logarithm of a floating-point tensor element-wise.",
+    "lowering_summary": "The Gluon log builtin re-exports the core Triton language math.log function, which enforces fp32/fp64 dtype constraints via a decorator before lowering. The argument is normalized to a tensor by the semantic layer's to_tensor method, then the builder's create_log is invoked. Because GluonOpBuilder inherits from TritonOpBuilder without overriding math operations, the lowering emits a single math.log MLIR operation on the input tensor handle. No additional TTGIR instructions are required for the operation itself; any masking, type conversions, or layout transformations are handled separately by the user or other builtins.",
+    "gluon_op_interface": "result = log(x)",
+    "code_snippet": "@gluon.jit\ndef math_kernel():\n    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\n    a = ttgl.full([16, 16], 1, ttgl.float32, layout)\n    ttgl.log(a)"
+  },
+  {
+    "gluon_op": "log2",
+    "ttgir_ops": [
+      "math.log2"
+    ],
+    "semantic": "Computes the base-2 logarithm of each element in the input tensor. Requires fp32 or fp64 dtype.",
+    "lowering_summary": "The log2 builtin delegates to Triton's math.log2, which enforces fp32/fp64 dtypes via _check_dtype before lowering. The Gluon semantic layer wraps scalars into tensors and preserves distributed layout metadata. The GluonOpBuilder inherits TritonOpBuilder's create_log2 method, which emits a single math.log2 MLIR operation with the same tensor type and layout as the input. No AMD-specific rewrites exist; the generic path always applies. The result tensor retains the input's shape, dtype, and layout without additional conversions or helper operations.",
+    "gluon_op_interface": "result = log2(x) OR result = x.log2()",
+    "code_snippet": "m_i = gl.zeros([BLOCK_M], dtype=gl.float32)\nl_i = gl.zeros([BLOCK_M], dtype=gl.float32)\n\nm_ij = gl.max(m_i, rowmax_ij)\nalpha = gl.exp2(m_i - m_ij)\nl_i = alpha * l_i + rowsum_ij\n\nm_i = m_ij + gl.log2(l_i)\ngl.store(L + offs_m, m_i)"
+  },
+  {
+    "gluon_op": "cos",
+    "ttgir_ops": [
+      "math.cos"
+    ],
+    "semantic": "Elementwise cosine for fp32 and fp64 tensors",
+    "lowering_summary": "The Gluon cos builtin wraps the classic Triton math.cos frontend, inheriting its dtype checks (fp32/fp64 only) and tensor promotion logic. User code calls ttgl.cos(x), which routes through the @builtin decorator to ensure the semantic context is live, then invokes to_tensor to promote scalars to Gluon tensors. The GluonSemantic instance passes the tensor handle to GluonOpBuilder.create_cos, which in turn emits an mlir::math::CosOp directly\u2014no type conversions, masks, or conditionals appear in the steady path. The result is a single TTGIR math.cos operation that performs elementwise cosine on the input tensor, preserving its shape and dtype.",
+    "gluon_op_interface": "result = ttgl.cos(x)",
+    "code_snippet": "@gluon.jit\ndef math_kernel():\n    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\n    a = ttgl.full([16, 16], 1, ttgl.float32, layout)\n    b = ttgl.full([16, 16], 2, ttgl.float32, layout)\n    c = ttgl.full([16, 16], 4, ttgl.float32, layout)\n    d = ttgl.full([16, 16], 1, ttgl.int32, layout)\n    e = ttgl.full([16, 16], 1, ttgl.int32, layout)\n    ttgl.umulhi(d, e)\n    ttgl.exp(a)\n    ttgl.exp2(a)\n    ttgl.log(a)\n    ttgl.log2(a)\n    ttgl.cos(a)\n    ttgl.sin(a)\n    ttgl.sqrt(a)\n    ttgl.sqrt_rn(a)\n    ttgl.rsqrt(a)\n    ttgl.abs(a)\n    ttgl.fdiv(a, b)\n    ttgl.div_rn(a, b)\n    ttgl.erf(a)\n    ttgl.floor(a)\n    ttgl.ceil(a)\n    ttgl.fma(a, b, c)"
+  },
+  {
+    "gluon_op": "rsqrt",
+    "ttgir_ops": [
+      "math.rsqrt"
+    ],
+    "semantic": "Computes the reciprocal square root (1/sqrt(x)) of a floating-point tensor",
+    "lowering_summary": "The rsqrt builtin is a thin wrapper that delegates directly to the MLIR math dialect's rsqrt operation. At the Gluon Python layer, the operation validates that the input tensor has fp32 or fp64 dtype via the _check_dtype decorator. The semantic layer converts the input to a tensor if needed, then invokes builder.create_rsqrt on the tensor's handle. In the C++ builder (ir.cc), create_rsqrt instantiates a math::RsqrtOp, which is a standard MLIR math dialect operation. No AMD-specific preprocessing occurs; the operation flows directly from Gluon to the math dialect. The builder preserves the input tensor type unchanged, so the result has the same shape and dtype as the input. This is a pure elementwise unary math operation with no layout considerations, broadcasting, or type promotion\u2014only dtype validation to ensure floating-point inputs.",
+    "gluon_op_interface": "result = rsqrt(x)",
+    "code_snippet": "a = ttgl.full([16, 16], 1, ttgl.float32, layout)\nttgl.rsqrt(a)"
+  },
+  {
+    "gluon_op": "sin",
+    "ttgir_ops": [
+      "math.sin"
+    ],
+    "semantic": "Computes element-wise sine of a floating-point tensor; requires fp32 or fp64 dtype.",
+    "lowering_summary": "The sin builtin is a direct re-export of the Triton math helper that enforces dtype restrictions (fp32/fp64) via _check_dtype and promotes scalars to tensors through _semantic.to_tensor. The lowering bypasses AMD-specific pre-semantic layers because sin is a generic math operation with no architecture-specific specialization. In the Gluon semantic layer, the GluonOpBuilder inherits from TritonOpBuilder and forwards the create_sin builder call directly to MLIR's math dialect. The C++ builder implementation in ir.cc binds create_sin to the MLIR math::SinOp, emitting a single math.sin operation on the distributed tensor type with no intermediate Triton dialect ops or layout transformations beyond those already present in the input tensor handle. The result tensor retains the same dtype and layout as the input.",
+    "gluon_op_interface": "result = sin(x)",
+    "code_snippet": "in_ptrs = in_ptr + in_offsets\nvalue = ttgl.load(in_ptrs, mask=mask)\nvalue = ttgl.sin(value)\nvalue = ttgl.maximum(value, 0.0)\nout_ptrs = out_ptr + out_offsets\nttgl.store(out_ptrs, value, mask=mask)"
+  },
+  {
+    "gluon_op": "sqrt",
+    "ttgir_ops": [
+      "math.sqrt"
+    ],
+    "semantic": "Computes the element-wise fast square root of a tensor",
+    "lowering_summary": "The sqrt builtin wraps Triton's standard math.sqrt operation. When called, the Gluon semantic layer converts the input to a tensor if needed, then invokes the builder's create_sqrt method which emits a single math.SqrtOp from the MLIR math dialect. The operation takes a floating-point tensor as input and returns a tensor of the same type containing the square root of each element. No special type checking or dtype restrictions are enforced at the Gluon level; the operation accepts any floating-point type supported by the underlying math dialect. The lowering is a direct one-to-one mapping with no intermediate transformations, broadcasting logic, or control flow.",
+    "gluon_op_interface": "result = sqrt(x)",
+    "code_snippet": "a = ttgl.full((16, 16), 1.0, ttgl.float32, layout=layout)\nttgl.sqrt(a)"
+  },
+  {
+    "gluon_op": "sqrt_rn",
+    "ttgir_ops": [
+      "tt.precise_sqrt"
+    ],
+    "semantic": "Computes precise square root of x with rounding to nearest according to IEEE standard",
+    "lowering_summary": "The sqrt_rn builtin lowers to a single tt.precise_sqrt operation in TTGIR. The function first validates that the input is fp32 dtype using a dtype checker decorator. The semantic layer converts the input to a tensor representation via to_tensor, then invokes builder.create_precise_sqrt which emits a tt.precise_sqrt MLIR operation. The tt.precise_sqrt operation is marked as elementwise, meaning it applies the precise square root independently to each element of the input tensor. Unlike the regular sqrt operation which may use fast approximations, precise_sqrt guarantees IEEE-compliant rounding to nearest for fp32 values, ensuring numerical accuracy at the cost of potential performance.",
+    "gluon_op_interface": "result = sqrt_rn(x)",
+    "code_snippet": "layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\na = ttgl.full([16, 16], 1, ttgl.float32, layout)\nttgl.sqrt_rn(a)"
+  },
+  {
+    "gluon_op": "abs",
+    "ttgir_ops": [
+      "math.absf",
+      "math.absi"
+    ],
+    "semantic": "Computes the element-wise absolute value of a tensor",
+    "lowering_summary": "The abs operation is lowered by dispatching on the input tensor's dtype in the Python frontend. For floating-point types, the builder emits math.absf via create_fabs; for signed integer types, it emits math.absi via create_iabs; for unsigned integers, the operation is a no-op and returns the input unchanged; for FP8E4B15 types, a bitwise AND with mask 0x7F clears the sign bit. The math dialect operations math.absf and math.absi pass through the Triton-to-TritonGPU conversion unchanged and are eventually lowered to LLVM intrinsics (llvm.fabs for floating-point, llvm.intr.abs for signed integers) during the TritonGPU-to-LLVM conversion. No Triton-specific absolute value operation exists; the lowering relies entirely on the upstream MLIR math dialect throughout the compilation pipeline.",
+    "gluon_op_interface": "result = abs(x)",
+    "code_snippet": "ttgl.cos(a)\nttgl.sin(a)\nttgl.sqrt(a)\nttgl.sqrt_rn(a)\nttgl.rsqrt(a)\nttgl.abs(a)\nttgl.fdiv(a, b)\nttgl.div_rn(a, b)\nttgl.erf(a)"
+  },
+  {
+    "gluon_op": "fdiv",
+    "ttgir_ops": [
+      "arith.divf"
+    ],
+    "semantic": "Floating-point division that requires both operands to be floating tensors, broadcasts shapes consistently, and emits a fast (non-IEEE) division operation.",
+    "lowering_summary": "Calling fdiv invokes the Triton language math function which unwraps the ieee_rounding flag and forwards to the semantic layer. GluonSemantic preserves distributed layout metadata during tensor operations. TritonSemantic.fdiv asserts both operands are floating types, applies binary_op_type_checking_impl to broadcast shapes without implicit integer promotion (div_or_mod=True, arithmetic_check=False), and calls builder.create_fdiv with the aligned operands. The ieee_rounding parameter is currently ignored, so all divisions use fast mode. GluonOpBuilder inherits from TritonOpBuilder, so create_fdiv resolves to a thin wrapper constructing mlir::arith::DivFOp. The result is a single arith.divf TTGIR operation carrying the distributed layout encoding in the tensor type.",
+    "gluon_op_interface": "result = fdiv(x, y, ieee_rounding=False)",
+    "code_snippet": "@gluon.jit\ndef math_kernel():\n    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\n    a = ttgl.full([16, 16], 1, ttgl.float32, layout)\n    b = ttgl.full([16, 16], 2, ttgl.float32, layout)\n    ttgl.fdiv(a, b)\n    ttgl.div_rn(a, b)"
+  },
+  {
+    "gluon_op": "div_rn",
+    "ttgir_ops": [
+      "tt.precise_divf"
+    ],
+    "semantic": "Computes precise division of two fp32 tensors, rounding to nearest according to the IEEE standard",
+    "lowering_summary": "The div_rn builtin is a direct alias to triton.language.math.div_rn, which enforces fp32 dtype via decorator checks. The implementation converts both operands to tensors through the semantic builder's to_tensor method, then calls binary_op_type_legalization to align shapes and insert any necessary broadcasts or casts. Once operands are legalized, the builder's create_precise_divf method emits a single tt.precise_divf operation in TTGIR. This op is an elementwise floating-point division that requires both operands and the result to share the same tensor type, guaranteeing IEEE-compliant rounding to nearest. No AMD-specific overrides or additional semantic layers exist; Gluon inherits the base Triton semantic logic and builder implementation unchanged.",
+    "gluon_op_interface": "result = div_rn(x, y)",
+    "code_snippet": "@gluon.jit\ndef math_kernel():\n    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\n    a = ttgl.full([16, 16], 1, ttgl.float32, layout)\n    b = ttgl.full([16, 16], 2, ttgl.float32, layout)\n    ttgl.fdiv(a, b)\n    ttgl.div_rn(a, b)\n    ttgl.fma(a, b, c)"
+  },
+  {
+    "gluon_op": "erf",
+    "ttgir_ops": [
+      "math.erf"
+    ],
+    "semantic": "Computes the error function of the input tensor elementwise, restricted to fp32 and fp64 dtypes, preserving layout metadata through the Gluon semantic layer.",
+    "lowering_summary": "The erf builtin is exposed via a simple re-export of the canonical Triton math helper. When a kernel author calls ttgl.erf(x), the @builtin decorator ensures a GluonSemantic object is injected. The Triton math layer validates that x is fp32 or fp64, canonicalizes it via _semantic.to_tensor (which preserves distributed layout metadata in Gluon), then calls builder.create_erf. Because GluonSemantic wraps a GluonOpBuilder that inherits all math op creation methods from TritonOpBuilder, the create_erf call dispatches directly to the shared C++ implementation. This emits a single mlir::math::ErfOp with no backend-specific branching or additional type conversions beyond the initial dtype check. The resulting TTGIR contains exactly one math.erf operation, and layout inference flows through unchanged since erf is purely elementwise. No AMD-specific overrides or special-case logic exist for this operation.",
+    "gluon_op_interface": "result = erf(x)",
+    "code_snippet": "@gluon.jit\ndef math_kernel():\n    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\n    a = ttgl.full([16, 16], 1, ttgl.float32, layout)\n    ttgl.erf(a)"
+  },
+  {
+    "gluon_op": "floor",
+    "ttgir_ops": [
+      "math.floor"
+    ],
+    "semantic": "Computes the element-wise floor (largest integer not greater than the input) of a floating-point tensor",
+    "lowering_summary": "The floor builtin accepts a single tensor argument of dtype fp32 or fp64, enforced by the _check_dtype decorator. The lowering is straightforward: the semantic layer converts the input to a tensor if needed, then directly invokes the builder's create_floor method passing the tensor handle. The C++ builder (ir.cc) creates a single math::FloorOp from the MLIR math dialect, which represents the mathematical floor operation. No type conversions, broadcasting, or conditional logic are involved\u2014the operation preserves the input tensor's type and shape while applying the floor function element-wise. The math::FloorOp is the invariant core operation that implements the floor semantic.",
+    "gluon_op_interface": "result = floor(x)",
+    "code_snippet": "layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])\na = ttgl.full([16, 16], 1, ttgl.float32, layout)\nttgl.floor(a)"
+  },
+  {
+    "gluon_op": "ceil",
+    "ttgir_ops": [
+      "math.ceilf"
+    ],
+    "semantic": "Computes the ceiling (smallest integer >= x) of a floating-point tensor element-wise.",
+    "lowering_summary": "The Gluon ceil builtin is a thin wrapper around the Triton math builtin, which validates that the input is fp32 or fp64, converts it to a tensor via _semantic.to_tensor, and calls _semantic.builder.create_ceil. The GluonSemantic layer inherits from TritonSemantic and supplies a GluonOpBuilder instance that preserves distributed layout metadata when wrapping the result. In the C++ bridge, GluonOpBuilder inherits TritonOpBuilder's create_ceil method, which directly emits a single math.ceilf MLIR operation consuming the operand SSA value with no additional attributes or auxiliary ops. The result SSA handle is wrapped back into a Gluon tensor with the inferred layout annotation intact, ensuring layout-aware downstream transformations can proceed.",
+    "gluon_op_interface": "result = ceil(x)",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "buffer_load",
+    "ttgir_ops": [
+      "amdg.buffer_load"
+    ],
+    "semantic": "AMD-specific load operation that accesses global memory via a scalar base pointer and a tensor of offsets, returning the loaded tensor directly into registers with optional masking and default values.",
+    "lowering_summary": "The buffer_load operation lowers from Gluon to a single TTGIR operation amdg.buffer_load (AMD GPU BufferLoadOp). The lowering process performs several preprocessing steps in the semantic layer: it validates that the pointer is a scalar pointer type and offsets is a distributed_type tensor with int32/uint32 elements; it broadcasts mask and other tensors to match the offsets shape if provided; it casts the other tensor to match the pointer's element type if present; and it converts the cache string modifier to an IR cache modifier enum (NONE, CA, CG, or CV). The result type is constructed by taking the offsets tensor's layout and shape but with the element type from the pointer's pointed-to type. The builder then creates the BufferLoadOp with these prepared operands, where mask and other are passed as empty IR values if None. This operation implements AMD's buffer load instruction which uses scalar-plus-offset addressing instead of tensor-of-pointers, enabling more efficient memory access patterns on AMD hardware.",
+    "gluon_op_interface": "result = buffer_load(ptr, offsets, mask=None, other=None, cache=None)",
+    "code_snippet": "layout = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 64], warps_per_cta=[4, 1], order=[1, 0])\noffsets = ttgl.arange(0, 64 * 64).reshape(64, 64)\noffsets = ttgl.convert_layout(offsets, layout=layout)\nmask = ttgl.full((64, 64), 1, tl.int1, layout=layout)\nother = ttgl.full((64, 64), 1.0, tl.float32, layout=layout)\na = ttgl.amd.cdna3.buffer_load(ptr=x, offsets=offsets, mask=mask, other=other, cache='.ca')"
+  },
+  {
+    "gluon_op": "buffer_store",
+    "ttgir_ops": [
+      "ttag.buffer_store"
+    ],
+    "semantic": "Stores a distributed tensor to global memory via a scalar base pointer plus an offsets tensor, with optional mask and cache modifiers",
+    "lowering_summary": "The buffer_store builtin validates that ptr is a scalar pointer and offsets is a distributed tensor of 32-bit integers. When a mask is provided, GluonSemantic.broadcast_impl_value aligns it to match the offsets tensor's distributed layout. Cache modifier strings are mapped to IR enums. The Gluon builder then directly emits a single ttag::BufferStoreOp carrying the stored value, scalar pointer, offsets tensor, optional mask, and cache modifier. Unlike pointer-based stores, buffer_store uses the offsets tensor for addressing and passes an empty stride value to the underlying builder. The resulting TTGIR operation encapsulates the complete scatter-store semantic in one instruction tailored for AMD CDNA3 buffer-based memory access patterns.",
+    "gluon_op_interface": "buffer_store(stored_value, ptr, offsets, mask=None, cache=None)",
+    "code_snippet": "c = ttgl.amd.cdna3.mfma(a1, b1, acc)\nc = ttgl.convert_layout(c, layout=blocked)\nc = c.to(a_ptr.dtype.element_ty)\noffs_cm = ttgl.arange(0, BLOCK_SIZE_M, layout=ttgl.SliceLayout(1, blocked))\noffs_cn = ttgl.arange(0, BLOCK_SIZE_N, layout=ttgl.SliceLayout(0, blocked))\noffs_c = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn\nttgl.amd.cdna3.buffer_store(stored_value=c, ptr=c_ptr, offsets=offs_c)"
+  },
+  {
+    "gluon_op": "ttgl.amd.cdna3.mfma",
+    "ttgir_ops": [
+      "tt.dot"
+    ],
+    "semantic": "Performs AMD MFMA matrix multiply-accumulate by forwarding layout-encoded operands to tt.dot",
+    "lowering_summary": "The mfma builtin unwraps constexpr inputs, asserts that the accumulator exists, and immediately delegates to the generic _semantic.dot(a, b, acc) with the accumulator's dtype and default input precision. Because the input tensors already carry AMDMFMALayout and DotOperandLayout encodings (materialized via _to_ir methods that call builder.get_amd_mfma_layout and get_dot_operand_layout to attach #ttg.amd_mfma and #ttg.dot_op attributes), the semantic layer validates shapes and dtypes, then emits a single tt.dot operation whose result type inherits the MFMA tiling from the accumulator. All MFMA-specific behavior\u2014instruction shape, warp count, transposition\u2014propagates purely through the tensor layout attributes rather than through distinct operations, so the lowering reduces to constructing one core tt.dot with the appropriately annotated types.",
+    "gluon_op_interface": "result = ttgl.amd.cdna3.mfma(a, b, acc)",
+    "code_snippet": "mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=3, warps_per_cta=[4, 1], instr_shape=[32, 32, 8], transposed=True)\na = ttgl.full([64, 32], 1.0, ttgl.float32, layout=ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8))\nb = ttgl.full([32, 64], 2.0, ttgl.float32, layout=ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8))\nacc = ttgl.full([64, 64], 0.0, ttgl.float32, layout=mfma_layout)\nacc = ttgl.amd.cdna3.mfma(a, b, acc)"
+  },
+  {
+    "gluon_op": "buffer_atomic_max",
+    "ttgir_ops": [
+      "ttag.buffer_atomic_rmw"
+    ],
+    "semantic": "Performs an atomic maximum operation on global memory using AMD buffer semantics, returning the original memory value before the update. The operation uses a scalar base pointer plus a tensor of byte offsets to address per-lane memory locations, with an optional mask to suppress specific lanes.",
+    "lowering_summary": "The builtin forwards to _buffer_atomic_rmw_impl which first validates that ptr is scalar, offsets is a tensor of int32 or uint32, and the pointee element type is one of the supported signed or unsigned integer types. It then maps the logical 'max' operation to either ATOMIC_OP.SMAX or ATOMIC_OP.UMAX based on the signedness of the element type. The mask and value parameters are normalized to tensors and broadcast to match the shape of offsets. Memory semantics default to acquire-release and scope defaults to GPU/agent level, with both convertible from user-provided string values to IR enums. The lowering directly invokes GluonOpBuilder.create_buffer_atomic_rmw in the C++ layer, which constructs a single ttag.BufferAtomicRMWOp with operands including the result type derived from the value type, the RMW operation enum, base pointer, offset tensor, value tensor, memory semantics, scope, and mask. No intermediate semantic rewrites occur because the builder directly emits the final TTGIR operation.",
+    "gluon_op_interface": "result = buffer_atomic_max(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "@gluon.jit\ndef kernel(int32_ptr, uint32_ptr, int64_ptr, fp16_ptr, fp32_ptr):\n    offsets = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\n    val = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\n    ttgl.amd.cdna3.buffer_atomic_max(int32_ptr, offsets, val)\n    val = ttgl.full([BLOCK], 1, ttgl.uint32, layout=ttgl.AutoLayout())\n    ttgl.amd.cdna3.buffer_atomic_max(uint32_ptr, offsets, val)"
+  },
+  {
+    "gluon_op": "buffer_atomic_min",
+    "ttgir_ops": [
+      "triton_amdgpu.buffer_atomic_rmw"
+    ],
+    "semantic": "Performs AMD buffer-style atomic minimum operation: loads from ptr + offsets, applies min with value, writes back if mask lane is true, and returns the original memory contents. Supports integer and floating-point types with automatic signed/unsigned variant selection.",
+    "lowering_summary": "The buffer_atomic_min builtin validates that ptr is a scalar pointer and offsets are distributed 32-bit integers, then maps the min operation string to the appropriate ATOMIC_OP flavor based on the pointer's pointee dtype (selecting signed or unsigned variants automatically). The mask parameter is converted to int1 and broadcast to match the offsets shape, while the value operand is broadcast to ensure consistent distributed layouts\u2014auto layouts are resolved to match explicit layouts before broadcasting. User-provided memory semantic and scope strings are converted to low-level enums via str_to_sem and str_to_scope helpers, defaulting to acquire-release GPU semantics when omitted. The GluonOpBuilder then emits a single triton_amdgpu.buffer_atomic_rmw TTGIR operation with the broadcast value's type as the result type, preserving the operand's block layout in the returned SSA value that holds the pre-operation memory contents.",
+    "gluon_op_interface": "result = buffer_atomic_min(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "BLOCK: ttgl.constexpr = 1\noffsets = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\n\nval = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\nttgl.amd.cdna3.buffer_atomic_max(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_min(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_and(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_or(int32_ptr, offsets, val)"
+  },
+  {
+    "gluon_op": "buffer_atomic_add",
+    "ttgir_ops": [
+      "amdg.buffer_atomic_rmw"
+    ],
+    "semantic": "Per-offset atomic add that uses a scalar global pointer plus an offsets tensor to issue atomic additions in global memory; each active lane adds its broadcasted value when mask[i] is true, honors the requested memory semantic/scope, and returns the pre-op value.",
+    "lowering_summary": "`buffer_atomic_add` is a thin wrapper that forwards to `_buffer_atomic_rmw_impl`, which first enforces that the base pointer is scalar, offsets are distributed int32/uint32 tensors, and maps `'add'` to the correct `ir.ATOMIC_OP` variant (integer ADD vs floating FADD) based on the pointee dtype for the CDNA3 target. Mask and value operands are unwrapped from constexprs, converted to tensors, cast (mask \u2192 int1), and broadcast to match `offsets` before the handles are extracted; string `sem`/`scope` options are turned into `ir.MEM_SEMANTIC` and `ir.MEM_SYNC_SCOPE` enums via the shared Triton semantic helpers. `_semantic.builder.create_buffer_atomic_rmw` then emits a `ttag.BufferAtomicRMWOp` with the resolved `tt::RMWOp`, pointer, offsets, value, mask, and memory attributes, returning a tensor typed like `value`. The C++ bindings expose the `ir.ATOMIC_OP`, `ir.MEM_SEMANTIC`, and `ir.MEM_SYNC_SCOPE` enums that the Python layer passes into the builder. The resulting TTGIR operation `amdg.buffer_atomic_rmw` encapsulates the actual semantics: it loads from `ptr[offsets]`, applies the atomic add with the provided value and mask, obeys the specified semantics/scope, and yields the pre-op tensor value, so no extra TTGIR ops beyond this atomic are needed.",
+    "gluon_op_interface": "buffer_atomic_add(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "mask = ttgl.full([BLOCK], True, ttgl.int32, layout=ttgl.AutoLayout())\nval = ttgl.zeros([BLOCK], ttgl.float16, layout=ttgl.AutoLayout())\nttgl.amd.cdna3.buffer_atomic_add(fp16_ptr, offsets, val, mask=mask, scope=\"cta\", sem=\"relaxed\")"
+  },
+  {
+    "gluon_op": "buffer_atomic_and",
+    "ttgir_ops": [
+      "triton_amdgpu.buffer_atomic_rmw"
+    ],
+    "semantic": "Performs a bitwise AND atomic read-modify-write operation on AMD buffer memory using a scalar base pointer and distributed offset tensor, returning the pre-operation value with the same shape and layout as the input value tensor.",
+    "lowering_summary": "The buffer_atomic_and builtin validates that ptr is a scalar pointer, offsets is a distributed int32 tensor, and value is an int32 or int64 tensor matching the pointer element type. The frontend implementation in cdna3/__init__.py verifies operand types via _verify_buffer_ops and maps the 'and' string to the ir.ATOMIC_OP.AND enum through _verify_element_type_and_dispatch_op. The generic _buffer_atomic_rmw_impl in the same file unwraps literals, broadcasts the mask and value operands to match offsets shape using GluonSemantic.broadcast_impl_value, converts optional sem/scope strings to ir.MEM_SEMANTIC and ir.MEM_SYNC_SCOPE enums via Triton semantic helpers, and invokes the builder. GluonOpBuilder.create_buffer_atomic_rmw in gluon_ir.cc constructs a single triton_amdgpu.buffer_atomic_rmw TTGIR operation with the scalar pointer, distributed offset/value/mask tensors, RMW operation enum, and memory ordering attributes; the result tensor inherits the value tensor's type, shape, and layout. The TTGIR op encodes AMD buffer addressing (base pointer plus per-element offsets), executes the atomic AND, and returns the old memory value before modification with the specified memory semantic and synchronization scope.",
+    "gluon_op_interface": "result = ttgl.amd.cdna3.buffer_atomic_and(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "val = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\nttgl.amd.cdna3.buffer_atomic_max(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_min(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_and(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_or(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_xor(int32_ptr, offsets, value=1)"
+  },
+  {
+    "gluon_op": "buffer_atomic_or",
+    "ttgir_ops": [
+      "amdg.buffer_atomic_rmw"
+    ],
+    "semantic": "Performs a bitwise OR read-modify-write operation on global memory at the given buffer offsets, returning the pre-operation values. The operation applies a mask predicate per lane and enforces memory ordering via user-specified semantics and scope.",
+    "lowering_summary": "The Gluon buffer_atomic_or builtin verifies that ptr is a scalar pointer to int32 or int64 elements and that offsets is a distributed int32/uint32 tensor, then maps the high-level 'or' string to the IR.ATOMIC_OP.OR enumeration. If a mask is provided it is unwrapped from constexprs, cast to ttgl.int1, and broadcast to match the offsets shape; similarly, the value operand is unwrapped and broadcast to align with offsets, determining the final result tensor shape. User-facing sem and scope strings default to 'acq_rel' and 'gpu' and are converted via _str_to_sem/_str_to_scope into the MEM_SEMANTIC and MEM_SYNC_SCOPE enums used by the backend. The GluonSemantic layer broadcasts all distributed operands to consistent shapes and layouts before invoking the builder, ensuring layout mismatches are resolved automatically. Finally, _buffer_atomic_rmw_impl calls builder.create_buffer_atomic_rmw, which emits a single amdg.buffer_atomic_rmw TTGIR operation carrying the or opcode, memory semantics, scope, the broadcasted value tensor, the scalar pointer base, the offset tensor, and the optional mask tensor, wrapping the returned handle as a ttgl.tensor so the frontend sees a distributed result matching the value's shape.",
+    "gluon_op_interface": "result = buffer_atomic_or(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "BLOCK: ttgl.constexpr = 1\noffsets = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\n\nval = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\nttgl.amd.cdna3.buffer_atomic_max(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_min(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_and(int32_ptr, offsets, val)\nttgl.amd.cdna3.buffer_atomic_or(int32_ptr, offsets, val)"
+  },
+  {
+    "gluon_op": "buffer_atomic_xor",
+    "ttgir_ops": [
+      "triton::amdgpu::BufferAtomicRMWOp"
+    ],
+    "semantic": "Atomic XOR against a scalar base pointer plus distributed offsets, returning the pre-operation value with optional masking and memory ordering control",
+    "lowering_summary": "The builtin validates that the pointer is scalar and offsets are int32/uint32 distributed tensors, restricting XOR to int32/int64 pointee types. It converts the value and optional mask to tensors, broadcasts them to match the offsets shape, and resolves sem/scope strings to LLVM memory ordering enums. The Gluon semantic layer then invokes the C++ builder to emit a single triton::amdgpu::BufferAtomicRMWOp with RMWOp=XOR, carrying the scalar base pointer, offsets tensor, broadcast value, optional mask, and memory semantics/scope attributes. This TTGIR operation directly models the per-lane atomic read-modify-write, which later AMD-specific passes convert into GCN buffer atomic instructions that compute ptr+offsets[i], perform XOR with value[i] under the specified memory ordering, and return the old value for masked lanes.",
+    "gluon_op_interface": "result = ttgl.amd.cdna3.buffer_atomic_xor(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "int32_ptr = ttgl.pointer_type(ttgl.int32, 3)\noffsets = ttgl.arange(0, 128)\nresult = ttgl.amd.cdna3.buffer_atomic_xor(int32_ptr, offsets, value=1)"
+  },
+  {
+    "gluon_op": "buffer_atomic_xchg",
+    "ttgir_ops": [
+      "ttag.buffer_atomic_rmw"
+    ],
+    "semantic": "Atomically exchanges a value at a buffer address computed from a scalar pointer and distributed offsets, returning the old value; enforces int32/int64 pointer element types and distributed offset tensors.",
+    "lowering_summary": "The builtin validates that ptr is scalar and offsets are distributed int32/uint32, then verifies the pointer element type is int32 or int64 and maps the operation string to ir.ATOMIC_OP.XCHG. It broadcasts value and the optional mask to the offsets shape, converts sem and scope string arguments to ir.MEM_SEMANTIC and ir.MEM_SYNC_SCOPE enums (defaulting to acq_rel and gpu respectively), and dispatches to GluonOpBuilder.create_buffer_atomic_rmw. The builder emits a single ttag::BufferAtomicRMWOp with the provided operands and attributes, returning the pre-exchange global value wrapped as a ttgl.tensor with the same type and layout as the broadcasted value. No AMD pre-semantic wrappers intercede; the lowering proceeds directly from the cdna3 builtin to the semantic layer and then to the TTGIR builder, preserving the buffer-based addressing model that distinguishes this path from the generic tt::AtomicRMWOp used for pointer-based atomics.",
+    "gluon_op_interface": "result = ttgl.amd.cdna3.buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "@gluon.jit\ndef kernel(int32_ptr, uint32_ptr, int64_ptr, fp16_ptr, fp32_ptr):\n    BLOCK: ttgl.constexpr = 1\n    offsets = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\n    val = ttgl.full([BLOCK], 1, dtype=ttgl.int32, layout=ttgl.AutoLayout())\n    val = val.cast(ttgl.int64)\n    ttgl.amd.cdna3.buffer_atomic_xchg(int64_ptr, offsets, val, mask=0)"
+  },
+  {
+    "gluon_op": "mfma_scaled",
+    "ttgir_ops": [
+      "tt.dot_scaled"
+    ],
+    "semantic": "Performs AMD CDNA4 scaled matrix-multiply-accumulate with FP8/e2m1 inputs and per-operand uint8 scale tensors, producing an FP32 accumulator result.",
+    "lowering_summary": "The mfma_scaled builtin validates that the accumulator uses AMDMFMALayout and that both operands are DotOperandLayout views sharing that parent layout, then asserts format strings are in {e2m1, e4m3, e5m2}. It forwards to _mma_scaled in the AMD pre-semantic layer, which computes the required scale tensor shapes from the operand layouts (accounting for e2m1's packed 32-element-per-byte structure), then either validates user-provided scales or synthesizes default uint8 scales filled with 0x7F via semantic.full (emitting tt.splat). The prepared operands, scales, and accumulator are passed to semantic.dot_scaled with hardcoded knobs (fast_math=False, lhs_k_pack=True, rhs_k_pack=True, out_dtype=float32). The semantic handler verifies scale shapes match the expected [M, K/32] and [N, K/32] dimensions after packing adjustments, then calls builder.create_dot_scaled to emit a single tt.dot_scaled TTGIR operation carrying the format enums and packing attributes. The resulting handle is wrapped back into a tensor with the accumulator's AMDMFMALayout, preserving layout metadata for subsequent Gluon passes.",
+    "gluon_op_interface": "result = ttgl.amd.cdna4.mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc)",
+    "code_snippet": "a = ttgl.amd.cdna4.load_a(a_ptr, offsets, stride, layout, ttgl.e2m1_fnuz)\nb = ttgl.amd.cdna4.load_b(b_ptr, offsets, stride, layout, ttgl.e2m1_fnuz)\na_scale = ttgl.load(a_scale_ptr, offsets, scale_layout)\nb_scale = ttgl.load(b_scale_ptr, offsets, scale_layout)\nacc = ttgl.full(layout, 0.0, ttgl.float32)\nc = ttgl.amd.cdna4.mfma_scaled(a, a_scale, 'e2m1', b, b_scale, 'e2m1', acc)"
+  },
+  {
+    "gluon_op": "buffer_atomic_max",
+    "ttgir_ops": [
+      "amdg.buffer_atomic_rmw"
+    ],
+    "semantic": "AMD buffer atomic read-modify-write operation that performs a max comparison between memory values at a scalar base pointer with tensor offsets and a tensor of comparison values, returning the old values before the update.",
+    "lowering_summary": "The buffer_atomic_max operation lowers through _buffer_atomic_rmw_impl which first verifies buffer operation constraints (ptr must be scalar pointer, offsets must be distributed int32/uint32 tensor). It then dispatches the 'max' operation string to the appropriate atomic operation enum based on element type: for signed integers (int32, int64, float64) it becomes ATOMIC_OP.MAX (smax), for unsigned integers (uint32, uint64) it becomes ATOMIC_OP.UMAX (umax), while floating-point types except float64 are rejected for max operations. The mask parameter, if provided, is broadcast to match offsets shape and cast to int1. The value parameter is also broadcast to match offsets. Memory semantics (sem) defaults to acquire-release if unspecified, and memory scope (scope) defaults to gpu synchronization level. Finally, the builder emits a single amdg.buffer_atomic_rmw operation with the dispatched atomic op enum, ptr handle, offsets handle, value handle, converted semantic and scope enums, and optional mask handle. The operation returns a tensor with the same type as the value input, containing the pre-operation memory values.",
+    "gluon_op_interface": "result = buffer_atomic_max(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": ""
+  },
+  {
+    "gluon_op": "buffer_atomic_min",
+    "ttgir_ops": [
+      "amdg.buffer_atomic_rmw"
+    ],
+    "semantic": "AMD buffer-addressing atomic read-modify-write returning the minimum of memory and value, signed or unsigned based on pointer element type.",
+    "lowering_summary": "The cdna4 buffer_atomic_min delegates to the shared _buffer_atomic_rmw_impl which first validates that ptr is a scalar pointer with an element type compatible with signed or unsigned min (int32/int64/float64 map to smin; uint32/uint64 map to umin; other types raise). It verifies offsets are distributed int32/uint32 tensors and broadcasts value to match offsets shape. Optional mask is cast to int1 and broadcast. Memory semantic and scope strings are converted to IR enums via TritonSemantic._str_to_sem and _str_to_scope. The semantic layer preserves distributed layout annotations as it forwards tensors to the C++ builder. GluonOpBuilder::create_buffer_atomic_rmw constructs ttag::BufferAtomicRMWOp with the resolved min/umin enum, emitting an amdg.buffer_atomic_rmw operation in TTGIR. The result tensor retains the broadcast layout so the distributed encoding remains consistent across the lowering stack. This path mirrors standard tt.AtomicRMWOp except the buffer variant uses offset-indexed addressing instead of pointer arithmetic.",
+    "gluon_op_interface": "result = buffer_atomic_min(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "val = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\nttgl.amd.cdna3.buffer_atomic_min(int32_ptr, offsets, val)\n\nval = ttgl.full([BLOCK], 1, ttgl.uint32, layout=ttgl.AutoLayout())\nttgl.amd.cdna3.buffer_atomic_min(uint32_ptr, offsets, val)"
+  },
+  {
+    "gluon_op": "buffer_atomic_add",
+    "ttgir_ops": [
+      "ttag.buffer_atomic_rmw"
+    ],
+    "semantic": "AMD buffer atomic add that performs read-modify-write on global memory using a scalar base pointer and tensor offsets, returning the pre-operation value",
+    "lowering_summary": "The buffer_atomic_add builtin lowers through AMD-specific pre-semantic processing that dispatches the 'add' operation to the appropriate atomic RMW variant based on element type. For integer types (uint32, uint64), it maps to 'iadd' (ATOMIC_OP.ADD), while for floating-point types (float16, float32, float64), it maps to 'fadd' (ATOMIC_OP.FADD). CDNA4 additionally supports bfloat16 via 'fadd'. The implementation validates that ptr is a scalar pointer and offsets is a distributed int32/uint32 tensor. The optional mask tensor is cast to int1 and broadcast to match offsets shape. The value tensor is also broadcast to match offsets. Memory semantic defaults to acq_rel if sem is None, and scope defaults to 'gpu' if None. The semantic layer constructs a ttag.BufferAtomicRMWOp with the dispatched atomic operation type, base pointer, offsets tensor, value tensor, memory semantic, scope, and optional mask. The operation returns a tensor with the same type as value, containing the pre-operation values from memory.",
+    "gluon_op_interface": "result = buffer_atomic_add(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "blocked = ttgl.BlockedLayout([SIZE_PER_THREAD], [64], [4], [0])\noffsets = ttgl.arange(0, BLOCK, layout=blocked)\nval = ttgl.full([BLOCK], 1.0, ttgl.bfloat16, layout=blocked)\nttgl.amd.cdna4.buffer_atomic_add(a, offsets, val, mask=1, scope=\"cta\", sem=\"relaxed\")"
+  },
+  {
+    "gluon_op": "buffer_atomic_and",
+    "ttgir_ops": [
+      "ttag.buffer_atomic_rmw"
+    ],
+    "semantic": "Performs a per-lane buffer-addressed atomic AND operation on int32 or int64 elements. The pointer must be scalar, offsets must be a distributed int32/uint32 tensor, and value/mask are broadcast to match offsets. Returns a tensor with the old values before the atomic operation.",
+    "lowering_summary": "The builtin delegates to _buffer_atomic_rmw_impl (shared with CDNA3) which verifies that the pointer is scalar and offsets are int32/uint32, restricts value to int32/int64 element types, and maps the string opcode \"and\" to ir.ATOMIC_OP.AND. The implementation unwraps constexpr arguments, broadcasts mask and value tensors to match the shape and distributed layout of offsets using GluonSemantic.broadcast_impl_value, and casts the mask to int1. Memory semantics (sem) and scope strings are converted to ir.MEM_SEMANTIC and ir.MEM_SYNC_SCOPE enums, defaulting to acquire-release on GPU. Finally, GluonOpBuilder.create_buffer_atomic_rmw emits a single ttag::BufferAtomicRMWOp with the scalar pointer, offsets tensor, broadcast value, null stride (indicating buffer mode), optional mask, and the resolved semantics/scope attributes. The result tensor preserves the distributed layout of the broadcast value and contains the pre-atomic element values.",
+    "gluon_op_interface": "result = ttgl.amd.cdna4.buffer_atomic_and(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "@gluon.jit\ndef kernel(int32_ptr, uint32_ptr, int64_ptr, fp16_ptr, fp32_ptr):\n    BLOCK: ttgl.constexpr = 1\n    offsets = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\n\n    val = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\n    ttgl.amd.cdna3.buffer_atomic_and(int32_ptr, offsets, val)"
+  },
+  {
+    "gluon_op": "buffer_atomic_or",
+    "ttgir_ops": [
+      "amdg.buffer_atomic_rmw"
+    ],
+    "semantic": "Atomically OR an integer value into buffer locations indexed by offsets, returning the old values before the operation",
+    "lowering_summary": "The builtin validates that the pointer is a scalar and offsets are int32/uint32 distributed tensors, then ensures the value element type is int32 or int64 (the only types allowed for bitwise atomic operations). The implementation converts the value to a tensor, broadcasts it to match the offsets shape, and optionally canonicalizes the mask to int1. The builder emits a single amdg.buffer_atomic_rmw operation with the 'or' RMWOp variant, passing the scalar pointer, offsets tensor, broadcast value, optional mask, and resolved memory semantic (defaulting to acquire-release) and scope (defaulting to gpu). The result type mirrors the value's element type, and each lane receives the old buffer value at its indexed location before the atomic OR was performed.",
+    "gluon_op_interface": "result = buffer_atomic_or(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "@gluon.jit\ndef kernel(int32_ptr):\n    BLOCK: ttgl.constexpr = 1\n    offsets = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\n    val = ttgl.full([BLOCK], 1, ttgl.int32, layout=ttgl.AutoLayout())\n    ttgl.amd.cdna3.buffer_atomic_or(int32_ptr, offsets, val)"
+  },
+  {
+    "gluon_op": "buffer_atomic_xor",
+    "ttgir_ops": [
+      "amdg.buffer_atomic_rmw"
+    ],
+    "semantic": "AMD buffer atomic XOR operation that performs bitwise XOR on global memory accessed via scalar base pointer plus tensor offsets, returning the pre-operation value.",
+    "lowering_summary": "The buffer_atomic_xor builtin lowers through _buffer_atomic_rmw_impl in the AMD pre-semantic layer. The implementation first validates that the pointer is a scalar pointer type and offsets is a distributed tensor of int32/uint32. It verifies the element type is int32 or int64 (the only types supporting XOR) and maps the 'xor' operation string to ir.ATOMIC_OP.XOR enum. The mask and value operands undergo broadcast alignment with offsets to ensure matching shapes. The mask is cast to int1 (boolean) type if provided, otherwise an empty ir.value() is used. Memory semantics default to ACQUIRE_RELEASE and scope defaults to GPU if not specified, converted via _str_to_sem and _str_to_scope helpers. Finally, the builder emits a single amdg.buffer_atomic_rmw operation with the XOR rmw_op attribute, scalar pointer, offset tensor, value tensor, stride (empty), memory semantic, sync scope, and optional mask. The operation returns a tensor with the same type as the value operand, containing the pre-XOR memory contents.",
+    "gluon_op_interface": "result = buffer_atomic_xor(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "int32_ptr = ...\noffsets = ttgl.arange(0, BLOCK, layout=ttgl.AutoLayout())\nttgl.amd.cdna3.buffer_atomic_xor(int32_ptr, offsets, value=1)"
+  },
+  {
+    "gluon_op": "buffer_atomic_xchg",
+    "ttgir_ops": [
+      "amdg.buffer_atomic_rmw"
+    ],
+    "semantic": "Atomically exchanges a value in global memory accessed via a scalar base pointer and tensor of offsets, returning the old value. Supports optional masking and configurable memory semantics and scope.",
+    "lowering_summary": "The buffer_atomic_xchg builtin is dispatched through _buffer_atomic_rmw_impl which first validates that ptr is a scalar pointer and offsets is a distributed tensor of int32/uint32 elements. The operation string 'xchg' is mapped to ir.ATOMIC_OP.XCHG via _verify_element_type_and_dispatch_op, which also confirms the element type is int32 or int64 (exchange only supports integer types on CDNA3/CDNA4). The mask parameter, if provided, is converted to a tensor, cast to int1, and broadcast to match the offsets shape; the value parameter undergoes the same broadcast process. Memory semantic strings (sem) such as 'acquire', 'release', 'acq_rel', or 'relaxed' are translated to ir.MEM_SEMANTIC enums, defaulting to ACQUIRE_RELEASE when None. Similarly, scope strings ('gpu', 'cta', 'sys') map to ir.MEM_SYNC_SCOPE enums, defaulting to GPU. The builder then emits a single ttag.BufferAtomicRMWOp (dialect prefix amdg) with the XCHG atomic operation, carrying the scalar pointer, offset tensor, value tensor, memory semantic, scope, and optional mask. The result type matches the value type, representing the pre-exchange memory value.",
+    "gluon_op_interface": "result = buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None)",
+    "code_snippet": "val = val.cast(ttgl.int64)\nttgl.amd.cdna3.buffer_atomic_xchg(int64_ptr, offsets, val, mask=0)"
+  },
+  {
+    "gluon_op": "global_load_to_shared",
+    "ttgir_ops": [
+      "ttg.async_copy_global_to_local",
+      "tt.broadcast"
+    ],
+    "semantic": "Asynchronous global-to-shared memory copy for AMD CDNA4, bypassing registers and requiring later wait synchronization",
+    "lowering_summary": "The builtin first validates that the destination memdesc and pointer tensor have matching shapes and that the pointer uses a blocked or sliced layout. Optional mask and other parameters are broadcast to align with the pointer shape using tt::BroadcastOp when needed. The cache_modifier string is converted to an ir.CACHE_MODIFIER enum, and the builtin then emits a single ttg::AsyncCopyGlobalToLocalOp with the destination descriptor, global pointer tensor, optional mask, optional fill value, cache modifier, fixed eviction policy (NORMAL), and non-volatile flag. This operation encodes the core asynchronous copy semantic that each thread's pointer element contributes to the shared memory write, which must later be synchronized via commit_group and wait_group.",
+    "gluon_op_interface": "global_load_to_shared(dest, ptr, mask=None, other=None, cache_modifier=\"\")",
+    "code_snippet": "dest = ttgl.alloc(M, dtype=INPUT_DTYPE, memory_space=MemorySpace.SHARED)\nttgl.amd.cdna4.global_load_to_shared(dest, tile_ptr)\nttgl.amd.cdna4.commit_group()\nttgl.amd.cdna4.wait_group(0)"
+  },
+  {
+    "gluon_op": "buffer_load_to_shared",
+    "ttgir_ops": [
+      "ttag.buffer_load_to_local"
+    ],
+    "semantic": "AMD async buffer load that transfers data from global memory to shared memory using scalar base pointer and tensor of 32-bit offsets, bypassing registers, with optional masking and cache control",
+    "lowering_summary": "The buffer_load_to_shared operation validates that offsets have BlockedLayout or SliceLayout and verifies buffer constraints via _verify_buffer_ops. If mask is provided, it broadcasts mask with offsets to ensure compatible shapes. If other is provided (requires mask to be non-None), it converts other to a tensor, casts it to match the pointer's element type, and broadcasts it with offsets. The cache_modifier string is converted to an IR cache modifier enum via _str_to_load_cache_modifier (supporting .ca, .cg, .cv). The semantic layer invokes builder.create_buffer_load_to_local with the destination shared memory descriptor handle, the scalar pointer handle, the offsets tensor handle, and optional mask, other, stride, and cache modifier attributes. This directly emits a single ttag.buffer_load_to_local operation that asynchronously loads from ptr[offsets] into the shared memory descriptor dest, returning an async token. The core semantic is a direct mapping from the Gluon builtin to the TTGIR AMD GPU dialect operation, with preprocessing to handle broadcasting, type casting, and cache modifier translation.",
+    "gluon_op_interface": "buffer_load_to_shared(dest, ptr, offsets, mask=None, other=None, cache_modifier=\"\")",
+    "code_snippet": "smem = ttgl.allocate_shared_memory(a_ptr.dtype.element_ty, [128, 16], shared)\noffsets = ttgl.arange(0, 128, layout=ttgl.SliceLayout(1, blocked))[:, None] * 16 + \\\n          ttgl.arange(0, 16, layout=ttgl.SliceLayout(0, blocked))[None, :]\ncdna4_async_copy.buffer_load_to_shared(smem, a_ptr, offsets)\ncdna4_async_copy.commit_group()\ncdna4_async_copy.wait_group(0)\na = cdna4_async_copy.load_shared_relaxed(smem, blocked)"
+  },
+  {
+    "gluon_op": "commit_group",
+    "ttgir_ops": [
+      "ttg.async_commit_group"
+    ],
+    "semantic": "Fence the set of async copies issued since the previous commit, reset the accumulation of outstanding copies, and return an async token for downstream waits to track group completion",
+    "lowering_summary": "The commit_group builtin accepts no user parameters and directly calls the GluonOpBuilder's create_async_commit_group method. The builder emits a single ttg.async_commit_group operation with an empty input token list and produces a fresh async token result (which the AMD builtin currently discards). This op serves as a fence that groups all preceding ttg.async_copy_global_to_local operations into a single commit group. AMD backend passes (LowerLoops and UpdateAsyncWaitCount) enforce that commit_group ops appear immediately after their corresponding async copy ops and use the count of commit groups to compute the outstanding asynchronous load count. Later wait_group calls consume this count to generate accurate hardware waitcnt instructions that stall until the committed shared-memory copies are visible, enabling pipelined execution while maintaining correct ordering.",
+    "gluon_op_interface": "commit_group()",
+    "code_snippet": "cp.global_to_shared(k_scale_buffer, k_scale_ptrs)\ncp.commit_group()\n\ncp.global_to_shared(v_scale_buffer, v_scale_ptrs)\ncp.commit_group()"
+  },
+  {
+    "gluon_op": "wait_group",
+    "ttgir_ops": [
+      "ttg.async_wait"
+    ],
+    "semantic": "Blocks execution until the number of outstanding async commit groups is less than or equal to the specified count.",
+    "lowering_summary": "The wait_group builtin synchronizes asynchronous memory operations by waiting for commit groups to complete. The user provides num_outstanding (defaulting to 0), which is unwrapped from constexpr if necessary. The semantic layer directly calls builder.create_async_wait_group with this count. In the C++ builder (gluon_ir.cc), create_async_wait_group constructs a ttg::AsyncWaitOp with an empty token range and the num parameter as an I32 attribute. The operation blocks until at most num_outstanding groups remain pending, enabling control over the pipeline depth in software-pipelined kernels. Uncommitted async operations are always waited upon even when num_outstanding is 0.",
+    "gluon_op_interface": "wait_group(num_outstanding=0)",
+    "code_snippet": "cp.wait_group(num_buffers - 1)\nread_idx = perform_add(read_idx, a_smem, b_smem, c_ptrs, ynumel, ystride_c, y_idx, xmask, YBLOCK, num_buffers,\n                       layout)\n\nfor i in gl.static_range(num_buffers - 1):\n    cp.wait_group(num_buffers - 2 - i)\n    read_idx = perform_add(read_idx, a_smem, b_smem, c_ptrs, ynumel, ystride_c, y_idx, xmask, YBLOCK, num_buffers,\n                           layout)"
+  },
+  {
+    "gluon_op": "load_shared_relaxed",
+    "ttgir_ops": [
+      "ttg.local_load"
+    ],
+    "semantic": "Loads a tensor from shared memory into registers with a specified distributed layout and annotates the operation to indicate it has been synchronized via async_wait, enabling safe overlap with outstanding async copies.",
+    "lowering_summary": "The builtin unwraps constexpr arguments and delegates to the Gluon semantic layer's shared_load method, which validates that the layout is a DistributedLayout, constructs the distributed result type, and calls the C++ builder's create_local_load to emit a ttg.local_load operation. After the semantic layer returns the tensor handle, the builtin sets the ttg.amdg.syncedViaAsyncWait attribute on the underlying MLIR value to signal that the load follows an async_wait barrier. This attribute is later consumed by AMD backend passes to optimize memory aliasing and avoid redundant synchronization, allowing the local load to safely overlap with in-flight async copy operations. The core semantic path reuses Triton's tensor wrapping and implicit casting mechanics inherited from TritonSemantic.",
+    "gluon_op_interface": "result = load_shared_relaxed(smem, layout)",
+    "code_snippet": "@gluon.jit\ndef kernel(a_ptr, b_ptr, use_buffer_load: ttgl.constexpr):\n    blocked: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [32, 2], [4, 1], [1, 0])\n    shared: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])\n    smem = ttgl.allocate_shared_memory(a_ptr.dtype.element_ty, [128, 16], shared)\n    cdna4_async_copy.global_load_to_shared(smem, a_ptr + offsets)\n    cdna4_async_copy.commit_group()\n    cdna4_async_copy.wait_group(0)\n    a = cdna4_async_copy.load_shared_relaxed(smem, blocked)\n    ttgl.store(b_ptr + offsets, a)"
+  },
+  {
+    "gluon_op": "make_tensor_descriptor",
+    "ttgir_ops": [
+      "tt.make_tensor_descriptor"
+    ],
+    "semantic": "Constructs a 2D AMD tensor descriptor encoding a rectangular slice of global memory (base pointer with shape and strides) mapped to a padded or swizzled shared-memory tile with zero-padding semantics for async TDM load/store operations.",
+    "lowering_summary": "The builtin validates that the descriptor is 2D and that base is a pointer type. It unwraps constexpr layout objects (PaddedSharedLayout or SwizzledSharedLayout with max_phase==1) and converts shape to i32 IR values and strides to i64 IR values. It constructs a tensor_descriptor_type wrapping the block type, shape tuple type, stride tuple type, and layout. The padding policy is hard-coded to PAD_ZERO via the semantic layer helper. Finally, the builtin invokes the GluonOpBuilder method create_make_tensor_descriptor which emits a single tt.make_tensor_descriptor operation in TTGIR, passing the result type, base handle, shape handles, stride handles, and padding option. This core operation encapsulates all metadata required by downstream TDM async copy intrinsics to know exactly what tile to transfer and how it maps into shared memory.",
+    "gluon_op_interface": "desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base, shape, strides, block_shape, layout)",
+    "code_snippet": "a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(\n    base=a_ptr + pid_m * BLOCK_M * stride_am,\n    shape=(M, K),\n    strides=(stride_am, stride_ak),\n    block_shape=(BLOCK_M, BLOCK_K),\n    layout=SHARED_LAYOUT_A)\na_buffer = ttgl.allocate_shared_memory(a_desc.dtype, shape=a_desc.block_shape, layout=a_desc.layout)\nfor k in range(0, ttgl.cdiv(K, BLOCK_K)):\n    if USE_TDM:\n        ttgl.amd.gfx1250.tdm.async_load(a_desc, [0, k * BLOCK_K], a_buffer)"
+  },
+  {
+    "gluon_op": "async_load",
+    "ttgir_ops": [
+      "ttg.async_tdm_copy_global_to_local"
+    ],
+    "semantic": "Asynchronously loads a global memory tile into local shared memory using a tensor descriptor and offsets, optionally signaling an mbarrier when complete.",
+    "lowering_summary": "The async_load builtin accepts a tensor descriptor created via make_tensor_descriptor, a list of offset values (constexpr scalars or scalar tensors) matching the descriptor rank, a shared_memory_descriptor destination allocated with matching dtype/shape/layout, and an optional mbarrier descriptor. The builtin converts offsets to 32-bit IR values through TritonSemantic's canonicalization logic, which enforces scalar integer inputs. It then invokes GluonOpBuilder.create_async_tdm_copy_global_to_local, which materializes an arith.constant predicate set to true and emits ttg.async_tdm_copy_global_to_local with the descriptor handle, offset operands, destination memdesc, the constant predicate, and the optional barrier handle. The descriptor itself is produced by calling create_make_tensor_descriptor, which emits tt.make_tensor_desc with base pointer, shape, strides, and padding options. Validation enforces that the descriptor is 2-D, that the shared layout is PaddedSharedLayout or SwizzledSharedLayout with max_phase equal to 1, that the destination memdesc matches the descriptor's advertised dtype/shape/layout, and that the barrier (if provided) is a shared memory descriptor. The async wait primitive routes to create_async_tdm_wait, emitting ttg.async_tdm_wait with an empty token list and an outstanding-count attribute to synchronize pipeline stages. This design ensures that kernel authors can pipeline multiple async loads into ping-pong LDS buffers by tracking the number of outstanding copies and waiting for earlier loads to complete before consuming tiles.",
+    "gluon_op_interface": "tdm.async_load(src, offsets, dest, mbarrier=None)",
+    "code_snippet": "ttgl.amd.gfx1250.tdm.async_load(a_desc, [0, load_idx * BLOCK_K],\n                                a_buffer.index(load_idx % NUM_BUFFERS))\nttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],\n                                b_buffer.index(load_idx % NUM_BUFFERS))\nload_idx += 1\nttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)\na = a_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)\nb = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)\naccumulator = ttgl.amd.gfx1250.wmma(a, b, accumulator)"
+  },
+  {
+    "gluon_op": "async_store",
+    "ttgir_ops": [
+      "amdg.async_tdm_copy_local_to_global"
+    ],
+    "semantic": "Asynchronously stores a shared memory tile to global memory using a tensor descriptor with computed offsets.",
+    "lowering_summary": "The async_store builtin accepts a tensor descriptor (previously created via make_tensor_descriptor), a list of scalar offset constexprs or rank-0 tensors, and a shared_memory_descriptor identifying the LDS tile to flush. Offsets are normalized to i32 via TritonSemantic._convert_to_ir_values with require_i64=False, ensuring scalar integer inputs. The GluonOpBuilder then emits a single amdg.async_tdm_copy_local_to_global operation, passing the descriptor SSA value, variadic i32 offset operands, and the shared-memory source handle. This fire-and-forget op has no return token; users must explicitly invoke async_wait to enforce in-flight counts. The descriptor itself is materialized by an earlier tt.make_tensor_desc op that encodes the base pointer, shape, strides, block dimensions, and the required PaddedSharedLayout or SwizzledSharedLayout with max_phase=1. No auxiliary masking, conversion, or predicate ops are emitted; all layout and bounds logic resides in the descriptor construction and subsequent hardware interpretation.",
+    "gluon_op_interface": "async_store(dest, offsets, src)",
+    "code_snippet": "@gluon.jit\ndef tensor_fill_kernel(a_ptr, M, N, BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr):\n    a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(\n        base=a_ptr, shape=(M, N), strides=(N, 1),\n        block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)\n    a_buffer = ttgl.allocate_shared_memory(a_desc.dtype, [NUM_BUFFERS] + a_desc.block_shape, a_desc.layout)\n\n    for i in ttgl.static_range(0, NUM_BUFFERS):\n        idx_n = pid_n * (BLOCK_N * NUM_BUFFERS) + i * BLOCK_N\n        ttgl.amd.gfx1250.tdm.async_store(a_desc, [idx_m, idx_n], a_buffer.index(i))\n\n    ttgl.amd.gfx1250.tdm.async_wait(0)"
+  },
+  {
+    "gluon_op": "async_wait",
+    "ttgir_ops": [
+      "ttag.async_tdm_wait"
+    ],
+    "semantic": "Waits for outstanding asynchronous TDM tensor operations to complete, blocking until only the specified number remain pending",
+    "lowering_summary": "The async_wait builtin takes a single scalar integer parameter num_outstanding that specifies how many asynchronous TDM operations should remain pending. The Python layer unwraps any constexpr value wrapper and passes the integer directly to the GluonOpBuilder. The C++ builder creates an empty ValueRange for tokens (TDM waits do not track explicit token dependencies in the current implementation) and emits a ttag.AsyncTDMWait operation with the token range and the num_outstanding count. This operation provides synchronization for the TDM async load/store pipeline, typically used in double-buffered or multi-buffered memory schemes where producers must wait before overwriting buffers that consumers are still reading. The wait count follows a producer-consumer pattern: waiting for N outstanding operations means all operations except the most recent N have completed, allowing kernels to pipeline memory transfers with computation by controlling how many in-flight transfers are permitted at each synchronization point.",
+    "gluon_op_interface": "async_wait(num_outstanding=0)",
+    "code_snippet": "if USE_TDM:\n    ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)\nelse:\n    ttgl.amd.gfx1250.async_copy.wait_group((NUM_BUFFERS - 1))\n\na = a_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)\nb = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)\naccumulator = ttgl.amd.gfx1250.wmma(a, b, accumulator)\nwmma_idx += 1"
+  },
+  {
+    "gluon_op": "init",
+    "ttgir_ops": [
+      "ttag.init_barrier"
+    ],
+    "semantic": "Initializes an mbarrier synchronization primitive in shared memory with a specified arrival count and sets the phase to 0.",
+    "lowering_summary": "The init builtin accepts a shared memory descriptor for the mbarrier and an integer count. It unwraps the count from any constexpr wrapper and directly invokes the builder's create_lds_barrier_init method, which emits a single ttag.init_barrier operation in the TTGIR. This operation takes the memory descriptor handle and the count as an integer attribute. The ttag.init_barrier op is defined in the AMD GPU dialect and initializes the barrier's pending arrival count to the specified value and sets the phase to 0, preparing the barrier for subsequent arrive and wait operations. There is no conditional logic or dtype specialization; the lowering is a straightforward one-to-one mapping from the Gluon builtin to the TTGIR operation.",
+    "gluon_op_interface": "ttgl.amd.gfx1250.mbarrier.init(mbarrier, count)",
+    "code_snippet": "mbar = ttgl.allocate_shared_memory(ttgl.int64, [1], ttgl.amd.gfx1250.mbarrier.MBarrierLayout())\nbuffer = ttgl.allocate_shared_memory(a_ptr.type.element_ty, [BLOCK_M, BLOCK_N], shared_layout)\nttgl.amd.gfx1250.mbarrier.init(mbar, count=NUM_WARPS * WARP_SIZE * 2)\nttgl.amd.gfx1250.async_copy.global_to_shared(buffer, a_ptrs)\nttgl.amd.gfx1250.async_copy.mbarrier_arrive(mbar)\nprior_phase = ttgl.amd.gfx1250.mbarrier.arrive(mbar)\nttgl.amd.gfx1250.mbarrier.wait(mbar, prior_phase)"
+  },
+  {
+    "gluon_op": "ttgl.amd.gfx1250.mbarrier.wait",
+    "ttgir_ops": [
+      "mlir::triton::amdgpu::WaitBarrierOp"
+    ],
+    "semantic": "Blocks the issuing wave until the addressed LDS mbarrier's phase differs from the provided prior phase, i.e., until all arrivals for that phase have completed.",
+    "lowering_summary": "The builtin is defined in triton/python/triton/experimental/gluon/language/amd/gfx1250/mbarrier.py:44-56, where user arguments `mbarrier` (a shared-memory descriptor) and `phase` are accepted and `_semantic.to_tensor` converts `phase` into a tensor handle before calling `_semantic.builder.create_lds_barrier_wait`. The conversion follows Triton's generic semantic rules: `to_tensor` plus `scalar_constant` in triton/python/triton/language/semantic.py:117-152 and 590-603 lower Python scalars to SSA values via builder helpers such as `get_int32`, which in turn materialize `arith.constant` ops inside the core builder defined in triton/python/src/ir.cc:843-869 (these helper constants are not counted as core TTGIR). No AMD-specific rewrite occurs in triton/python/triton/experimental/gluon/language/amd/_ops.py, so the builtin routes straight to the generic semantic. Finally, the Gluon semantic builder (`_semantic.builder`, an instance of `GluonOpBuilder`) invokes `create_lds_barrier_wait` in triton/python/src/gluon_ir.cc:867-874, which emits the single TTGIR op `mlir::triton::amdgpu::WaitBarrierOp` with the barrier memdesc and phase SSA operands, completing the lowering chain from Gluon to TTGIR.",
+    "gluon_op_interface": "wait(mbarrier, phase)",
+    "code_snippet": "mbar = ttgl.allocate_shared_memory(ttgl.int64, [1], ttgl.amd.gfx1250.mbarrier.MBarrierLayout())\nttgl.amd.gfx1250.mbarrier.init(mbar, count=NUM_WARPS * WARP_SIZE * 2)\nttgl.amd.gfx1250.async_copy.mbarrier_arrive(mbar)\nprior_phase = ttgl.amd.gfx1250.mbarrier.arrive(mbar)\nttgl.amd.gfx1250.mbarrier.wait(mbar, prior_phase)"
+  },
+  {
+    "gluon_op": "arrive",
+    "ttgir_ops": [
+      "ttag.arrive_barrier"
+    ],
+    "semantic": "Decrement the memory barrier's pending arrival counter by count, wrap the phase once zero is reached, and return the prior phase as an int32 tensor for later synchronization.",
+    "lowering_summary": "The arrive builtin accepts a shared_memory_descriptor (allocated via MBarrierLayout) and an optional compile-time count defaulting to 1. The _unwrap_if_constexpr helper enforces that count is a literal, matching the C++ signature. The semantic layer extracts the MLIR MemDescType handle from the descriptor and calls GluonOpBuilder::create_lds_barrier_arrive, which directly emits a single ttag::ArriveBarrierOp with the memDesc operand and count attribute. The returned SSA value is wrapped as a ttgl.tensor of dtype int32, representing the barrier phase before the arrival, which kernel authors then pass to mbarrier.wait to synchronize. No type conversions or control-flow scaffolding appear; the lowering is a one-to-one mapping from the Python builtin to the TTGIR op, enforcing the AMD LDS barrier protocol at the MLIR level.",
+    "gluon_op_interface": "result = ttgl.amd.gfx1250.mbarrier.arrive(mbarrier, *, count=1)",
+    "code_snippet": "mbar = ttgl.allocate_shared_memory((1,), ttgl.int32, MBarrierLayout())\nmbarrier.init(mbar, expected=1)\nasync_load_descriptor = make_amd_load_descriptor(...)\ntriton.language.amd.async_copy_tdm(async_load_descriptor)\nprior_phase = mbarrier.arrive(mbar)\nmbarrier.wait(mbar, prior_phase)"
+  },
+  {
+    "gluon_op": "wmma",
+    "ttgir_ops": [
+      "ttir.dot"
+    ],
+    "semantic": "Matrix multiply-accumulate for AMD gfx1250 WMMA tiles. Accepts two dot-operand tensors (a, b) and an accumulator (acc) all sharing AMDWMMALayout(version=3) encoding, then emits a fused dot product with the accumulator.",
+    "lowering_summary": "The wmma builtin enforces strict layout requirements in the AMD pre-semantic layer: the accumulator must use AMDWMMALayout(version=3) and both multiplicands must be DotOperandLayout views into the same WMMA layout. After validation, _wmma delegates to GluonSemantic.dot, which inherits Triton's dot semantics to verify dtype compatibility, shape legality, and accumulator matching. The semantic layer computes the result block type and forwards the operation to GluonOpBuilder, a thin wrapper ensuring Gluon layouts propagate into MLIR. The builder's create_dot method emits a single ttir.DotOp with the three operands and optional precision attributes. During codegen, the TTGIR DotOp paired with AMDWMMALayout encodings lowers to gfx1250 v_wmma_* instructions, completing the path from high-level Gluon call to hardware-level wave matrix multiply-accumulate.",
+    "gluon_op_interface": "result = ttgl.amd.gfx1250.wmma(a, b, acc)",
+    "code_snippet": "accumulator = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=c_ptr.type.element_ty, layout=WMMA_LAYOUT)\nfor k in range(0, ttgl.cdiv(K, BLOCK_K)):\n    a = ttgl.convert_layout(a, ttgl.DotOperandLayout(0, WMMA_LAYOUT, K_WIDTH))\n    b = ttgl.convert_layout(b, ttgl.DotOperandLayout(1, WMMA_LAYOUT, K_WIDTH))\n    accumulator = ttgl.amd.gfx1250.wmma(a, b, accumulator)"
+  },
+  {
+    "gluon_op": "wmma_scaled",
+    "ttgir_ops": [
+      "tt.dot_scaled"
+    ],
+    "semantic": "Performs a scaled matrix multiplication using AMD WMMA instructions with microscaling formats (e2m1, e4m3, e5m2), returning an FP32 accumulator",
+    "lowering_summary": "The wmma_scaled builtin first validates that operands and accumulator use matching AMDWMMALayout with [16,16,64] instruction shapes for e2m1 formats and [16,16,128] accumulator shapes. It delegates to _mma_scaled which computes per-operand scale tensor shapes accounting for packed e2m1 data (unpack factor 2) and K-dimension packing rules. If scale tensors are not provided, _create_and_broadcast_default_scale allocates distributed uint8 tensors filled with neutral scale value 0x7F using semantic.full. The helper then invokes semantic.dot_scaled with fast_math=False, lhs_k_pack=True, rhs_k_pack=True, requesting an FP32 accumulator. The Triton semantic layer unwraps constexpr format strings into ScaleDotElemType enums, bitcasts tensor payloads into the requested float formats while keeping e2m1 data packed as uint8, enforces packing constraints, adjusts logical M/N sizes for unpacked operands, validates scale tensor shapes, and prepares the accumulator by building a splat if needed. Finally, builder.create_dot_scaled emits a single tt.dot_scaled operation with operand handles, optional scale handles, format enum attributes, packing flags, and the FP32 accumulator, which later MLIR pipelines lower to AMD v_wmma_scale_* instructions.",
+    "gluon_op_interface": "result = wmma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc)",
+    "code_snippet": "b_scale = ttgl.load(b_scale_ptr + offs_b_scale)\nb_scale = ttgl.convert_layout(b_scale, layout.b_scale)\nzero = ttgl.zeros([BLOCK_M, BLOCK_N], dtype=ttgl.float32, layout=layout.acc)\nc = ttgl.amd.gfx1250.wmma_scaled(a, a_scale, a_type, b, b_scale, b_type, zero)\nc = c.to(c_ptr.dtype.element_ty)\noffs_cm = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, layout.acc))"
+  },
+  {
+    "gluon_op": "global_to_shared",
+    "ttgir_ops": [
+      "ttg.async_copy_global_to_local"
+    ],
+    "semantic": "Asynchronously copies elements from global memory to shared memory using hardware async copy instructions, requiring manual synchronization via wait_group before accessing loaded data.",
+    "lowering_summary": "The global_to_shared builtin lowers directly to a single ttg.async_copy_global_to_local operation. The lowering validates that the pointer is a tensor with a DistributedLayout and that smem shape matches pointer shape. If mask is provided, it is broadcast to match pointer shape. If other is provided, it is converted to a tensor, cast to pointer's element type, and broadcast to match pointer shape. The cache_modifier string is converted to an enum value. The builder emits ttg.async_copy_global_to_local with the shared memory descriptor handle, pointer handle, mask handle (or empty value if None), other handle (or empty value if None), the cache modifier enum, a NORMAL eviction policy, and isVolatile=false. This operation initiates an asynchronous copy that transfers data from global memory addresses (given by pointer tensor) into the shared memory buffer (smem descriptor) without blocking, allowing overlap with computation. The async copy must be committed to a group via commit_group and synchronized via wait_group before the data can be safely accessed from shared memory.",
+    "gluon_op_interface": "global_to_shared(smem, pointer, mask=None, other=None, cache_modifier=\"\")",
+    "code_snippet": "mask_a = offs_ak[None, :] < K - load_idx * BLOCK_K\nttgl.amd.gfx1250.async_copy.global_to_shared(a_buffer.index(load_idx % NUM_BUFFERS), a_ptrs, mask_a,\n                                             other=0.0)\n\nmask_b = offs_bk[:, None] < K - load_idx * BLOCK_K\nttgl.amd.gfx1250.async_copy.global_to_shared(b_buffer.index(load_idx % NUM_BUFFERS), b_ptrs, mask_b,\n                                             other=0.0)\nttgl.amd.gfx1250.async_copy.commit_group()"
+  },
+  {
+    "gluon_op": "mbarrier_arrive",
+    "ttgir_ops": [
+      "amdg.async_copy_mbarrier_arrive"
+    ],
+    "semantic": "Arrive on memory barrier once all outstanding async copies to local data share (LDS) are complete, decrementing the barrier's pending count by 1.",
+    "lowering_summary": "The mbarrier_arrive builtin accepts a shared memory descriptor representing a barrier object and lowers directly to a single TTGIR operation amdg.async_copy_mbarrier_arrive. The semantic layer invokes the GluonOpBuilder method create_async_copy_lds_barrier_arrive, passing the barrier's IR handle. This builder method constructs an AsyncCopyMbarrierArriveOp from the TritonAMDGPU dialect. The operation performs an asynchronous arrive on the memory barrier, which decrements the barrier's pending count by 1 when all previously issued async load operations to local data share (LDS) have completed. The instruction is asynchronous and returns immediately. If the pending count reaches zero after decrementing, the barrier's phase is decremented in a wraparound manner and the pending count is reloaded with the initial count value. This provides a synchronization mechanism for coordinating async memory operations within AMD GFX1250 kernels.",
+    "gluon_op_interface": "mbarrier_arrive(mbarrier)",
+    "code_snippet": "mbar = ttgl.allocate_shared_memory(ttgl.int64, [1], ttgl.amd.gfx1250.mbarrier.MBarrierLayout())\nbuffer = ttgl.allocate_shared_memory(a_ptr.type.element_ty, [BLOCK_M, BLOCK_N], shared_layout)\nttgl.amd.gfx1250.mbarrier.init(mbar, count=NUM_WARPS * WARP_SIZE * 2)\nttgl.amd.gfx1250.async_copy.global_to_shared(buffer, a_ptrs)\nttgl.amd.gfx1250.async_copy.mbarrier_arrive(mbar)\nprior_phase = ttgl.amd.gfx1250.mbarrier.arrive(mbar)\nttgl.amd.gfx1250.mbarrier.wait(mbar, prior_phase)"
+  },
+  {
+    "gluon_op": "wmma",
+    "ttgir_ops": [
+      "tt.dot"
+    ],
+    "semantic": "wmma enforces that acc carries an AMDWMMALayout and that a/b use DotOperandLayout fragments, then invokes semantic.dot to multiply the operands into the accumulator.",
+    "lowering_summary": "The wmma builtin first validates that the accumulator has an AMDWMMALayout of the requested version and that operands a and b use DotOperandLayout fragments tied to that layout. It then calls semantic.dot with the three operands, input_precision derived from knobs.language.fp32_default, max_num_imprecise_acc set to None, and out_dtype matching the accumulator dtype. The semantic layer performs dtype and shape validation, enforces backend min_dot_size constraints, and derives the accumulator element type from the operands. Because acc is required for WMMA, its handle and AMDWMMALayout-encoded tensor become the result type, and max_num_imprecise_acc resolves to 0 for fp16 fragments. The lowering ultimately reaches GluonOpBuilder.create_dot in C++, which builds a single MLIR tt.dot operation using a, b, and the accumulator as operands, plus an InputPrecision attribute derived from the language knob. The emitted TTGIR contains this tt.dot that multiplies two dot_op-encoded fragments into an amd_wmma accumulator.",
+    "gluon_op_interface": "result = wmma(a, b, acc)",
+    "code_snippet": "wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(version=1, transposed=True, warps_per_cta=[4, 1])\na = ttgl.full([64, 64], 1.0, ttgl.float16, layout=ttgl.DotOperandLayout(0, wmma_layout, 16))\nb = ttgl.full([64, 64], 2.0, ttgl.float16, layout=ttgl.DotOperandLayout(1, wmma_layout, 16))\nacc = ttgl.full([64, 64], 0.0, ttgl.float32, layout=wmma_layout)\nacc = ttgl.amd.rdna3.wmma(a, b, acc)"
+  },
+  {
+    "gluon_op": "wmma",
+    "ttgir_ops": [
+      "tt.dot"
+    ],
+    "semantic": "Matrix multiply-accumulate operation using AMD WMMA (Wave Matrix Multiply-Accumulate) instruction for RDNA4 architecture",
+    "lowering_summary": "The wmma builtin for AMD RDNA4 is a specialized matrix multiplication operation that forwards to the generic dot semantic. The builtin first verifies that all operands have compatible AMDWMMALayout with version=2 (RDNA4 variant): the accumulator must have AMDWMMALayout(version=2), and both operands a and b must have DotOperandLayout whose parent is the same AMDWMMALayout(version=2). After validation, it delegates to the semantic dot operation, passing the operands along with input_precision and max_num_imprecise_acc parameters. The semantic dot operation performs dtype validation (supporting int8, uint8, float16, bfloat16, float32, float64, and fp8 variants), handles special cases for deprecated fp8 formats by upcasting to fp16, validates that operand shapes are 2D or 3D with compatible dimensions for matrix multiplication, determines the output scalar type based on input types and out_dtype parameter, creates a zero-initialized accumulator if none is provided, and finally emits a single tt.dot TTGIR operation. The tt.dot operation encodes the matrix multiplication semantics (d = a * b + c) along with the input_precision attribute (controlling tensor core usage for fp32 inputs: tf32, tf32x3, ieee, bf16x3, bf16x6) and max_num_imprecise_acc attribute (for fp8 operations). The result is wrapped in the original accumulator's distributed type, preserving the AMDWMMALayout for subsequent operations.",
+    "gluon_op_interface": "result = ttgl.amd.rdna4.wmma(a, b, acc)",
+    "code_snippet": "a = ttgl.load(a_ptr + offs_a)\nb = ttgl.load(b_ptr + offs_b)\n\na = ttgl.convert_layout(a, layout=ttgl.DotOperandLayout(0, WMMA_LAYOUT, K_WIDTH))\nb = ttgl.convert_layout(b, layout=ttgl.DotOperandLayout(1, WMMA_LAYOUT, K_WIDTH))\n\nacc = ttgl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], ttgl.float32, WMMA_LAYOUT)\nc = ttgl.amd.rdna4.wmma(a, b, acc)\nc = c.to(a_ptr.dtype.element_ty)"
+  }
+]
