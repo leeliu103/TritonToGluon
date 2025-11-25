@@ -58,14 +58,6 @@ GLUON_TUTORIAL_FILES = [
     f"{TRITON_PATH}/python/tutorials/gluon/08-warp-specialization.py",
 ]
 
-# AMD Reference Examples
-GLUON_AMD_EXAMPLE_FILES = [
-    f"{TRITON_PATH}/third_party/amd/python/examples/gluon/f16_fa_gfx1250.py",
-    f"{TRITON_PATH}/third_party/amd/python/examples/gluon/f16_gemm_gfx1250.py",
-    f"{TRITON_PATH}/third_party/amd/python/examples/gluon/mxfp_fa_gfx1250.py",
-    f"{TRITON_PATH}/third_party/amd/python/examples/gluon/mxfp_gemm_gfx1250.py",
-]
-
 # Tests & QA Assets
 GLUON_TEST_FILES = [
     f"{TRITON_PATH}/python/test/gluon/test_core.py",
@@ -79,6 +71,5 @@ GLUON_TEST_FILES = [
 # All Gluon kernel example files combined
 ALL_GLUON_EXAMPLE_FILES = (
     GLUON_TUTORIAL_FILES +
-    GLUON_AMD_EXAMPLE_FILES +
     GLUON_TEST_FILES
 )
