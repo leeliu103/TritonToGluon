@@ -58,6 +58,20 @@ GLUON_TUTORIAL_FILES = [
     f"{TRITON_PATH}/python/tutorials/gluon/08-warp-specialization.py",
 ]
 
+# Triton Tutorial Files
+TRITON_TUTORIAL_FILES = [
+    f"{TRITON_PATH}/python/tutorials/01-vector-add.py",
+    f"{TRITON_PATH}/python/tutorials/02-fused-softmax.py",
+    f"{TRITON_PATH}/python/tutorials/03-matrix-multiplication.py",
+    f"{TRITON_PATH}/python/tutorials/04-low-memory-dropout.py",
+    f"{TRITON_PATH}/python/tutorials/05-layer-norm.py",
+    f"{TRITON_PATH}/python/tutorials/06-fused-attention.py",
+    f"{TRITON_PATH}/python/tutorials/07-extern-functions.py",
+    f"{TRITON_PATH}/python/tutorials/08-grouped-gemm.py",
+    f"{TRITON_PATH}/python/tutorials/09-persistent-matmul.py",
+    f"{TRITON_PATH}/python/tutorials/10-block-scaled-matmul.py",
+]
+
 # Tests & QA Assets
 GLUON_TEST_FILES = [
     f"{TRITON_PATH}/python/test/gluon/test_core.py",
