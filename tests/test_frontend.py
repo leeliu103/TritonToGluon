@@ -162,6 +162,17 @@ def _write_module_file(root: Path, module_name: str, source: str) -> Path:
     return module_path
 
 
+def _call_graph_key(kernel: object) -> str:
+    """Mirror the parser's qualified-name key to avoid accidental collisions in tests."""
+
+    base = getattr(kernel, "fn", kernel)
+    simple_name = getattr(base, "__name__", getattr(base, "__qualname__", repr(base)))
+    qual_component = getattr(base, "__qualname__", simple_name)
+    module_name = getattr(base, "__module__", None)
+    qualified = ".".join(part for part in (module_name, qual_component) if part)
+    return qualified or simple_name
+
+
 @pytest.fixture
 def kernel_parser() -> KernelParser:
     """Provide a fresh KernelParser per test."""
@@ -269,7 +280,7 @@ def test_kernel_parser_regular_function_captures_source_and_globals(kernel_parse
     assert parsed.filename == inspect.getsourcefile(_regular_reference_kernel)
     assert parsed.globals_map is _regular_reference_kernel.__globals__
     assert isinstance(parsed.tree, ast.AST)
-    assert parsed.call_graph[_regular_reference_kernel.__name__] == []
+    assert parsed.call_graph[_call_graph_key(_regular_reference_kernel)] == []
     assert parsed.name == _regular_reference_kernel.__name__
 
 
@@ -282,7 +293,7 @@ def test_kernel_parser_jit_function_uses_fn_globals_fallback(kernel_parser: Kern
     assert parsed.source == jit_kernel.src
     assert parsed.filename is None  # stub JITFunction has no file metadata
     assert parsed.globals_map is _jit_reference_kernel.__globals__
-    assert parsed.call_graph[jit_kernel.__name__] == []
+    assert parsed.call_graph[_call_graph_key(jit_kernel)] == []
 
 
 def test_kernel_parser_missing_source_returns_stub_ast(kernel_parser: KernelParser) -> None:
@@ -299,7 +310,7 @@ def test_kernel_parser_missing_source_returns_stub_ast(kernel_parser: KernelPars
     assert parsed.source == ""
     assert parsed.filename is None
     assert parsed.globals_map is None
-    assert parsed.call_graph[parsed.name] == []
+    assert parsed.call_graph[_call_graph_key(kernel)] == []
     assert isinstance(parsed.tree.body[0], ast.Pass)
 
 
@@ -334,7 +345,8 @@ def test_call_graph_kernel_without_dependencies(kernel_parser: KernelParser, fak
         """,
     )
     graph = kernel_parser.parse_kernel(kernel).call_graph
-    assert graph["root"] == []
+    root_key = _call_graph_key(kernel)
+    assert graph[root_key] == []
 
 
 def test_call_graph_records_single_level_dependency(kernel_parser: KernelParser, fake_kernel_factory: Callable[..., Any]) -> None:
@@ -356,7 +368,7 @@ def test_call_graph_records_single_level_dependency(kernel_parser: KernelParser,
         """,
         globals_map=root_scope,
     )
-    deps = kernel_parser.parse_kernel(root).call_graph["root"]
+    deps = kernel_parser.parse_kernel(root).call_graph[_call_graph_key(root)]
     assert len(deps) == 1
     dependency = deps[0]
     assert dependency.name == "child"
@@ -394,9 +406,12 @@ def test_call_graph_builds_transitive_dependencies(kernel_parser: KernelParser, 
         globals_map=root_scope,
     )
     graph = kernel_parser.parse_kernel(root).call_graph
-    assert "root" in graph and graph["root"][0].obj is mid
-    assert "mid" in graph and graph["mid"][0].obj is leaf
-    assert graph["leaf"] == []
+    root_key = _call_graph_key(root)
+    mid_key = _call_graph_key(mid)
+    leaf_key = _call_graph_key(leaf)
+    assert root_key in graph and graph[root_key][0].obj is mid
+    assert mid_key in graph and graph[mid_key][0].obj is leaf
+    assert graph[leaf_key] == []
 
 
 def test_call_graph_handles_kernel_launch_syntax(kernel_parser: KernelParser, fake_kernel_factory: Callable[..., Any]) -> None:
@@ -418,7 +433,7 @@ def test_call_graph_handles_kernel_launch_syntax(kernel_parser: KernelParser, fa
         """,
         globals_map=scope,
     )
-    deps = kernel_parser.parse_kernel(root).call_graph["root"]
+    deps = kernel_parser.parse_kernel(root).call_graph[_call_graph_key(root)]
     assert len(deps) == 1 and deps[0].obj is callee
 
 
@@ -454,7 +469,7 @@ def test_call_graph_records_multiple_dependencies_without_duplicates(
         """,
         globals_map=scope,
     )
-    deps = kernel_parser.parse_kernel(root).call_graph["root"]
+    deps = kernel_parser.parse_kernel(root).call_graph[_call_graph_key(root)]
     assert {dep.obj for dep in deps} == {left, right}
 
 
@@ -480,8 +495,10 @@ def test_call_graph_prevents_infinite_loops_for_circular_dependencies(
     kernel_a.fn.__globals__["kernel_b"] = kernel_b
     kernel_b.fn.__globals__["kernel_a"] = kernel_a
     graph = kernel_parser.parse_kernel(kernel_a).call_graph
-    assert graph["kernel_a"][0].obj is kernel_b
-    assert graph["kernel_b"][0].obj is kernel_a
+    kernel_a_key = _call_graph_key(kernel_a)
+    kernel_b_key = _call_graph_key(kernel_b)
+    assert graph[kernel_a_key][0].obj is kernel_b
+    assert graph[kernel_b_key][0].obj is kernel_a
 
 
 def test_call_graph_preserves_qualified_names_for_colliding_functions(
@@ -514,10 +531,63 @@ def test_call_graph_preserves_qualified_names_for_colliding_functions(
         """,
         globals_map={"alpha_alias": alpha, "beta_alias": beta},
     )
-    deps = kernel_parser.parse_kernel(root).call_graph["root"]
+    deps = kernel_parser.parse_kernel(root).call_graph[_call_graph_key(root)]
     assert len(deps) == 2
     qualified = {dep.qualified_name for dep in deps}
     assert qualified == {f"{alpha.__module__}.shared", f"{beta.__module__}.shared"}
+
+
+def test_call_graph_qualified_names_prevent_collision_across_modules(
+    kernel_parser: KernelParser,
+    fake_kernel_factory: Callable[..., Any],
+    module_builder: Callable[[str, str], tuple[types.ModuleType, Path]],
+) -> None:
+    """Two kernels with same name from different modules should both appear in call graph."""
+
+    alpha_module, _ = module_builder(
+        "pkg.alpha",
+        """
+        from triton.runtime.jit import jit
+
+        @jit
+        def shared(x):
+            return x + 1
+        """,
+    )
+    beta_module, _ = module_builder(
+        "pkg.beta",
+        """
+        from triton.runtime.jit import jit
+
+        @jit
+        def shared(x):
+            return x * 2
+        """,
+    )
+    root = fake_kernel_factory(
+        "root",
+        """
+        def root(x):
+            alpha_shared(x)
+            beta_shared(x)
+            return x
+        """,
+        globals_map={"alpha_shared": alpha_module.shared, "beta_shared": beta_module.shared},
+    )
+    parsed = kernel_parser.parse_kernel(root)
+    graph = parsed.call_graph
+    root_key = _call_graph_key(root)
+    alpha_key = _call_graph_key(alpha_module.shared)
+    beta_key = _call_graph_key(beta_module.shared)
+
+    assert root_key in graph
+    assert alpha_key in graph
+    assert beta_key in graph
+
+    qualified_children = {dep.qualified_name for dep in graph[root_key]}
+    assert qualified_children == {alpha_key, beta_key}
+    assert graph[alpha_key] == []
+    assert graph[beta_key] == []
 
 
 def test_call_dependency_dataclass_captured_fields(kernel_parser: KernelParser, fake_kernel_factory: Callable[..., Any]) -> None:
@@ -538,7 +608,7 @@ def test_call_dependency_dataclass_captured_fields(kernel_parser: KernelParser, 
         """,
         globals_map={"callee": callee},
     )
-    dependency = kernel_parser.parse_kernel(root).call_graph["root"][0]
+    dependency = kernel_parser.parse_kernel(root).call_graph[_call_graph_key(root)][0]
     assert is_dataclass(CallDependency)
     assert [field.name for field in fields(CallDependency)] == ["name", "qualified_name", "module", "obj"]
     assert dependency.obj is callee
@@ -929,8 +999,10 @@ def test_integration_kernel_parser_and_scope_analyzer_on_triton_pattern(
     )
     parsed = kernel_parser.parse_kernel(module.root)
     graph = parsed.call_graph
-    assert graph["root"][0].obj.fn is module.mid.fn
-    assert graph["mid"][0].obj.fn is module.leaf.fn
+    root_key = _call_graph_key(module.root)
+    mid_key = _call_graph_key(module.mid)
+    assert graph[root_key][0].obj.fn is module.mid.fn
+    assert graph[mid_key][0].obj.fn is module.leaf.fn
 
     names = {entry.name for entry in parsed.constexpr_metadata}
     assert {"BLOCK", "TILE", "factor", "flags"}.issubset(names)

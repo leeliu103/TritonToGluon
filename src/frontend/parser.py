@@ -53,6 +53,19 @@ class ParsedKernel:
         return getattr(self.kernel, "__name__", repr(self.kernel))
 
 
+def _resolve_kernel_identity(callable_obj: Any) -> tuple[str, str, Optional[str]]:
+    """Return simple and qualified names plus module for callable objects."""
+
+    base_function = getattr(callable_obj, "fn", callable_obj)
+    simple_name = getattr(base_function, "__name__", getattr(base_function, "__qualname__", repr(base_function)))
+    qual_component = getattr(base_function, "__qualname__", simple_name)
+    module_name = getattr(base_function, "__module__", None)
+    qualified_name = ".".join(part for part in (module_name, qual_component) if part)
+    if not qualified_name:
+        qualified_name = simple_name
+    return simple_name, qualified_name, module_name
+
+
 class _CallGraphRecorder:
     """Helper that deduplicates callees for the kernel call graph."""
 
@@ -62,11 +75,7 @@ class _CallGraphRecorder:
     def record(self, callable_obj: Any) -> None:
         if not isinstance(callable_obj, triton_jit.JITCallable):
             return
-        base_function = getattr(callable_obj, "fn", callable_obj)
-        simple_name = getattr(base_function, "__name__", getattr(base_function, "__qualname__", repr(base_function)))
-        module_name = getattr(base_function, "__module__", None)
-        qual_name = getattr(base_function, "__qualname__", simple_name)
-        qualified_name = ".".join(part for part in (module_name, qual_name) if part)
+        simple_name, qualified_name, module_name = _resolve_kernel_identity(callable_obj)
         key = qualified_name or simple_name
         if key in self._dependencies:
             return
@@ -147,9 +156,10 @@ class KernelParser:
         """
 
         tree, source, filename, globals_map, metadata_collector = self._parse_tree_and_metadata(kernel)
-        root_name = self._kernel_name(kernel)
+        # Use fully-qualified identifiers so adjacency keys cannot collide across modules.
+        root_key = self._call_graph_key(kernel)
         call_graph = self._build_call_graph(
-            root_name=root_name, initial_collector=metadata_collector, root_kernel=kernel
+            root_key=root_key, initial_collector=metadata_collector, root_kernel=kernel
         )
         constexpr_metadata = metadata_collector.extract_constexpr_metadata()
         return ParsedKernel(
@@ -195,19 +205,16 @@ class KernelParser:
         except (OSError, TypeError):
             return None
 
-    def _kernel_name(self, kernel: object) -> str:
-        return getattr(kernel, "__name__", repr(kernel))
-
     def _build_call_graph(
-        self, root_name: str, initial_collector: "_KernelMetadataCollector", root_kernel: object
+        self, root_key: str, initial_collector: "_KernelMetadataCollector", root_kernel: object
     ) -> Dict[str, Sequence[CallDependency]]:
         # Mirror the translator's breadth-first queue so we capture transitive dependencies.
         adjacency: Dict[str, Sequence[CallDependency]] = {}
-        direct_graph = initial_collector.build_call_graph(self_name=root_name)
-        direct_dependencies = list(direct_graph.get(root_name, []))
-        adjacency[root_name] = direct_dependencies
+        direct_graph = initial_collector.build_call_graph(self_name=root_key)
+        direct_dependencies = list(direct_graph.get(root_key, []))
+        adjacency[root_key] = direct_dependencies
 
-        queue: deque[triton_jit.JITCallable] = deque()
+        queue: deque[tuple[str, triton_jit.JITCallable]] = deque()
         seen_callables: Set[int] = set()
         if isinstance(root_kernel, triton_jit.JITCallable):
             seen_callables.add(id(root_kernel))
@@ -221,23 +228,30 @@ class KernelParser:
                 if callee_id in seen_callables:
                     continue
                 seen_callables.add(callee_id)
-                queue.append(callee)
+                # Track the qualified name so adjacency keys stay unique per module.
+                queue.append((dependency.qualified_name, callee))
 
         enqueue_from_dependencies(direct_dependencies)
 
         while queue:
-            callee = queue.popleft()
-            callee_name, callee_dependencies = self._parse_dependency_call_graph(callee)
-            adjacency.setdefault(callee_name, callee_dependencies)
+            callee_key, callee = queue.popleft()
+            resolved_key, callee_dependencies = self._parse_dependency_call_graph(callee, callee_key)
+            adjacency.setdefault(resolved_key, callee_dependencies)
             enqueue_from_dependencies(callee_dependencies)
 
         return adjacency
 
-    def _parse_dependency_call_graph(self, callable_obj: triton_jit.JITCallable) -> tuple[str, Sequence[CallDependency]]:
+    def _parse_dependency_call_graph(
+        self, callable_obj: triton_jit.JITCallable, call_graph_key: Optional[str] = None
+    ) -> tuple[str, Sequence[CallDependency]]:
         _, _, _, _, collector = self._parse_tree_and_metadata(callable_obj)
-        callee_name = self._kernel_name(callable_obj)
-        callee_graph = collector.build_call_graph(self_name=callee_name)
-        return callee_name, list(callee_graph.get(callee_name, []))
+        callee_key = call_graph_key or self._call_graph_key(callable_obj)
+        callee_graph = collector.build_call_graph(self_name=callee_key)
+        return callee_key, list(callee_graph.get(callee_key, []))
+
+    def _call_graph_key(self, kernel: object) -> str:
+        _, qualified_name, _ = _resolve_kernel_identity(kernel)
+        return qualified_name
 
 
 class _KernelMetadataCollector(ast.NodeVisitor):
