@@ -8,12 +8,16 @@ API while the implementations remain stubs.
 
 from __future__ import annotations
 
-from .parser import KernelParser, ParsedKernel
-from .scope import ScopeAnalyzer, SymbolTable
+from .parser import CallDependency, ConstexprMetadata, KernelParser, ParsedKernel
+from .scope import ScopeAnalyzer, SymbolBinding, SymbolTable, SymbolType
 
 __all__ = [
+    "CallDependency",
+    "ConstexprMetadata",
     "KernelParser",
     "ParsedKernel",
+    "SymbolBinding",
     "ScopeAnalyzer",
     "SymbolTable",
+    "SymbolType",
 ]
