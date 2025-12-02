@@ -1,4 +1,0 @@
-triton_op: arange
-gluon_template: ttgl.arange({start}, {stop}, layout={layout})
-requirements:
-  layout: required

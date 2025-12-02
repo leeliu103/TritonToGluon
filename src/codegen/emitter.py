@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .lowering import GluonModule
+from .generator import GluonModule, _BASE_IMPORTS
 
 
 class CodeEmitter:
@@ -23,17 +23,19 @@ class CodeEmitter:
 
         path = self.output_dir / f"{kernel_name}.gluon.py"
         lines: list[str] = ["# Auto-generated Gluon kernel (skeleton)"]
-        lines.extend(module.imports)
-        lines.append("")
-        for kernel in module.kernels:
-            lines.extend(kernel.decorators)
-            lines.append(f"def {kernel.name}(*args, **kwargs):")
-            if not kernel.instructions:
-                lines.append("    pass  # TODO: populate with lowered IR")
-            else:
-                for instr in kernel.instructions:
-                    comment = f"  # {instr.comment}" if instr.comment else ""
-                    lines.append(f"    {instr.op}({', '.join(instr.args)}){comment}")
+
+        import_block = module.imports or list(_BASE_IMPORTS)
+        lines.extend(import_block)
+        if import_block:
             lines.append("")
-        path.write_text("\n".join(lines) + "\n")
+
+        if module.constexprs:
+            lines.extend(module.constexprs)
+            lines.append("")
+
+        for kernel in module.kernels:
+            lines.append(kernel.source)
+            lines.append("")
+
+        path.write_text("\n".join(lines).rstrip() + "\n")
         return path

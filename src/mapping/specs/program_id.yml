@@ -1,4 +1,0 @@
-triton_op: program_id
-gluon_template: ttgl.program_id({axis})
-requirements:
-  layout: scalar

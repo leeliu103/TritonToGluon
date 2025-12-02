@@ -1,7 +1,7 @@
-"""Semantic mapping between Triton IR nodes and Gluon constructs."""
+"""Semantic mapping between Triton AST nodes and Gluon constructs."""
 
 from __future__ import annotations
 
-from .registry import MappingRegistry
+from .function_registry import MappingFunctionRegistry, registry
 
-__all__ = ["MappingRegistry"]
+__all__ = ["MappingFunctionRegistry", "registry"]
