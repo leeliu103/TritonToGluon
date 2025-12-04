@@ -3,21 +3,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING
 
-from .layouts import LayoutMap
+from .layouts import LayoutMetadata
+from .location import NodeLocation
 
 if TYPE_CHECKING:  # pragma: no cover - type hint helpers
     from ..frontend.parser import ParsedKernel  # circular import guard
 
 
-@dataclass(slots=True)
-class TTGIROutput:
-    """Container for TTGIR data passed to mapping/codegen layers."""
+@dataclass
+class NodeMetadata:
+    """All metadata for a single Triton operation (layouts only for now)."""
 
-    spec_matches: Mapping[str, object] = field(default_factory=dict)
-    layouts: LayoutMap = field(default_factory=dict)
-    diagnostics: Sequence[str] = field(default_factory=tuple)
+    layouts: dict[str, LayoutMetadata] = field(default_factory=dict)
+
+    def get_layout(self, name: str | None) -> LayoutMetadata | None:
+        """Return a specific layout (or the only layout present)."""
+
+        if name is None:
+            if len(self.layouts) == 1:
+                return next(iter(self.layouts.values()))
+            return None
+        return self.layouts.get(name)
+
+
+@dataclass
+class TTGIROutput:
+    """TTGIR extraction results with location-based lookup."""
+
+    metadata: dict[NodeLocation, NodeMetadata] = field(default_factory=dict)
+
+    def get_layout(self, location: NodeLocation, name: str | None) -> LayoutMetadata | None:
+        """Return layout metadata for location if present."""
+
+        entry = self.metadata.get(location)
+        return entry.get_layout(name) if entry else None
 
 
 class TTGIRExtractor:
@@ -35,4 +56,4 @@ class TTGIRExtractor:
         return TTGIROutput()
 
 
-__all__ = ["TTGIROutput", "TTGIRExtractor"]
+__all__ = ["NodeMetadata", "TTGIROutput", "TTGIRExtractor"]

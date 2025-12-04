@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Mapping, TypeAlias, Union
+from typing import TypeAlias, Union
 
 from triton.experimental.gluon.language._layouts import (
     AutoLayout,
@@ -34,11 +34,8 @@ LayoutMetadata: TypeAlias = Union[
     SwizzledSharedLayout,
 ]
 
-LayoutMap = Mapping[str, LayoutMetadata]
-
 __all__ = [
     "LayoutMetadata",
-    "LayoutMap",
     "AutoLayout",
     "BlockedLayout",
     "CoalescedLayout",

@@ -30,7 +30,7 @@ TritonToGluon translates Triton JIT kernels into Gluon kernels so existing Trito
 ## 2. Pipeline Flow
 
 1. **Frontend (unchanged)** – `src/frontend/parser.py` parses Triton kernels into `ParsedKernel` objects that include the AST, source text, filename, globals, constexpr metadata, and a lightweight call graph. This stage preserves enough context for constexpr/global reconstruction later.
-2. **TTGIR extraction (stub)** – `src/ttgir/extractor.py` exposes `TTGIRExtractor.extract`. Today it simply returns `TTGIROutput(spec_matches={}, layouts={})`, but the method signature already accepts optional MLIR dumps and `ParsedKernel`s so real extraction logic can be plugged in later.
+2. **TTGIR extraction (stub)** – `src/ttgir/extractor.py` exposes `TTGIRExtractor.extract`. Today it simply returns `TTGIROutput()` (an empty metadata container), but the method signature already accepts optional MLIR dumps and `ParsedKernel`s so real extraction logic can be plugged in later.
 3. **Mapping registry** – `src/mapping/function_registry.py` provides `MappingFunctionRegistry`, a decorator-based registry for Python mapping helpers. Files under `src/mapping/functions/` (e.g., `arange.py`, `program_id.py`, `dot.py`) register **actual Gluon helpers** via `@registry.register("<op>")`. The registry stores callable references so the code generator can import those helpers directly.
 4. **Code generation** – `src/codegen/generator.py` implements `CodeGenerator`. It deep-copies the Triton AST, uses `_CallMappingTransformer` to rewrite Triton builtins by consulting the registry, injects `@gluon.jit` decorators, and `ast.unparse`s function definitions into `GluonKernel.source`. `CodeEmitter` (`src/codegen/emitter.py`) prepends the canonical Gluon import block, adds any helper imports requested by the transformer, and writes the kernel definitions into `.gluon.py` files.
 
@@ -45,7 +45,7 @@ TritonToGluon translates Triton JIT kernels into Gluon kernels so existing Trito
 ### TTGIR (`src/ttgir`)
 
 - **Purpose** – Provide data structures (`LayoutMetadata`, `BlockedLayout`, `SliceLayout`) and a future-proof extraction API (`TTGIRExtractor`, `TTGIROutput`).
-- **Key classes** – `TTGIROutput` groups `spec_matches`, `layouts`, and placeholder diagnostics. `TTGIRExtractor.extract` accepts a `ParsedKernel` plus an optional MLIR dump and returns empty metadata for now.
+- **Key classes** – `TTGIROutput` groups location-based `NodeMetadata`, while `NodeLocation` encodes the `{file, op, line, column}` identity for each Triton op. `TTGIRExtractor.extract` accepts a `ParsedKernel` plus an optional MLIR dump and returns empty metadata for now.
 - **Notes** – Because TTGIR is a stub, consumers must tolerate missing layout information. The simplified pipeline still threads `TTGIROutput` through mapping helpers so the interface remains stable when extraction becomes real.
 
 ### Mapping (`src/mapping`)
@@ -67,7 +67,7 @@ TritonToGluon translates Triton JIT kernels into Gluon kernels so existing Trito
 | Structure | Location | Key fields | Role |
 |-----------|----------|------------|------|
 | `ParsedKernel` | `src/frontend/parser.py` | `kernel`, `tree`, `source`, `globals_map`, `call_graph`, `constexpr_metadata` | Canonical representation of the Triton kernel fed into the backend pipeline. |
-| `TTGIROutput` | `src/ttgir/extractor.py` | `spec_matches`, `layouts`, `diagnostics` | Placeholder container for extracted metadata; currently empty but plumbed through the pipeline. |
+| `TTGIROutput` | `src/ttgir/extractor.py` | `metadata` | Placeholder container for extracted metadata keyed by `NodeLocation`; currently empty but plumbed through the pipeline. |
 | `GluonKernel` | `src/codegen/generator.py` | `name`, `source` | One Gluon function produced by `ast.unparse`. |
 | `GluonModule` | `src/codegen/generator.py` | `imports`, `kernels` | Aggregates helper import statements plus the generated kernel sources for emission. |
 

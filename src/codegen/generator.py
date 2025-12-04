@@ -18,6 +18,7 @@ from ..mapping.function_registry import MappingFunctionRegistry, registry as def
 from ..ttgir import (
     DistributedLayout,
     LayoutMetadata,
+    NodeLocation,
     SharedLayout,
     SliceLayout,
     TTGIROutput,
@@ -160,7 +161,7 @@ class CodeGenerator:
         metadata_entries: list[ConstexprMetadata] = list(parsed_kernel.constexpr_metadata)
         constexpr_values: dict[str, Any] = {}
         self._merge_constexpr_values(constexpr_values, parsed_kernel.globals_map)
-        diagnostics: list[str] = list(ttgir_output.diagnostics)
+        diagnostics: list[str] = []
 
         while queue:
             key = queue.popleft()
@@ -297,13 +298,6 @@ class CodeGenerator:
 
 class _CallMappingTransformer(ast.NodeTransformer):
     """Internal helper that rewrites calls using the mapping registry."""
-
-    _METADATA_PARAMS: Mapping[str, Sequence[str]] = {
-        "arange": ("layout",),
-        "dot": ("layout_a", "layout_b", "input_precision"),
-        "dot_scaled": ("layout_a", "layout_b", "input_precision"),
-        "program_id": ("layout",),
-    }
     _LAYOUT_RESET_OPS: set[str] = {"reshape", "trans", "permute", "join", "reduce", "split"}
 
     def __init__(
@@ -328,6 +322,8 @@ class _CallMappingTransformer(ast.NodeTransformer):
         if parsed_kernel.filename and "__file__" not in self.scope:
             self.scope["__file__"] = parsed_kernel.filename
         self._current_function: ast.FunctionDef | None = None
+        self._kernel_filename = parsed_kernel.filename or "<unknown>"
+        self._metadata_params: dict[str, tuple[str, ...]] = {}
 
     # ------------------------------------------------------------------ visits
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
@@ -372,9 +368,6 @@ class _CallMappingTransformer(ast.NodeTransformer):
         layout_expr = self._slice_layout_from_metadata(node)
         if layout_expr is None:
             layout_expr = self._default_slice_layout(node, expanded_dim)
-            self.diagnostics.append(
-                f"Missing SliceLayout metadata for broadcast at {self._node_lookup_key(node)}; using default layout."
-            )
         ast.copy_location(layout_expr, node)
         converted = ast.Call(
             func=self._ttgl_attr("convert_layout"),
@@ -399,9 +392,6 @@ class _CallMappingTransformer(ast.NodeTransformer):
             return self._wrap_tensor_method_layout(node)
         helper_fn = self.registry.lookup(op_name)
         if helper_fn is None:
-            self.diagnostics.append(
-                f"Unmapped Triton op '{op_name}' at {self._node_lookup_key(node)}; leaving call unchanged."
-            )
             return self._wrap_layout_sensitive_builtin(node, op_name)
         replacement = self._rewrite_call(node, op_name, helper_fn)
         if replacement is None:
@@ -474,7 +464,7 @@ class _CallMappingTransformer(ast.NodeTransformer):
         return rewritten
 
     def _build_metadata_keywords(self, node: ast.Call, op_name: str) -> list[ast.keyword]:
-        expected = self._METADATA_PARAMS.get(op_name, ())
+        expected = self._metadata_requirements(op_name)
         if not expected:
             return []
         existing = {kw.arg for kw in node.keywords if kw.arg}
@@ -482,11 +472,8 @@ class _CallMappingTransformer(ast.NodeTransformer):
         for meta_name in expected:
             if meta_name in existing:
                 continue
-            value = self._metadata_value_for(node, meta_name)
+            value = self._metadata_value_for(node, op_name, meta_name)
             if value is None:
-                self.diagnostics.append(
-                    f"Missing TTGIR metadata '{meta_name}' for {self._node_lookup_key(node)}."
-                )
                 continue
             value_node = self._value_to_ast(value)
             ast.copy_location(value_node, node)
@@ -562,33 +549,27 @@ class _CallMappingTransformer(ast.NodeTransformer):
             f"from triton.tools.triton_to_gluon_translater.translator_helpers import {helper_name}"
         )
 
-    def _metadata_value_for(self, node: ast.Call, meta_name: str) -> Any:
+    def _metadata_requirements(self, op_name: str) -> tuple[str, ...]:
+        cached = self._metadata_params.get(op_name)
+        if cached is not None:
+            return cached
+        schema = self.registry.get_schema(op_name)
+        requirements = schema.layout_names() if schema is not None else ()
+        result = tuple(requirements)
+        self._metadata_params[op_name] = result
+        return result
+
+    def _metadata_value_for(self, node: ast.Call, op_name: str, meta_name: str) -> Any:
         if meta_name.startswith("layout"):
-            return self._extract_layout_metadata(node, meta_name)
-        if meta_name == "input_precision":
-            return self._extract_spec_metadata(node, meta_name)
+            return self._extract_layout_metadata(node, op_name, meta_name)
         return None
 
-    def _extract_layout_metadata(self, node: ast.Call, meta_name: str) -> Any:
-        node_key = self._node_lookup_key(node)
-        layout_entry = self.ttgir_output.layouts.get(node_key)
-        if isinstance(layout_entry, Mapping):
-            return layout_entry.get(meta_name)
-        return layout_entry
+    def _extract_layout_metadata(self, node: ast.AST, op_name: str, meta_name: str) -> Any:
+        location = self._node_location(node, op_name)
+        return self.ttgir_output.get_layout(location, meta_name)
 
-    def _extract_spec_metadata(self, node: ast.Call, meta_name: str) -> Any:
-        node_key = self._node_lookup_key(node)
-        candidates = (f"{node_key}:{meta_name}", meta_name)
-        for key in candidates:
-            if key in self.ttgir_output.spec_matches:
-                return self.ttgir_output.spec_matches[key]
-        return None
-
-    def _node_lookup_key(self, node: ast.AST) -> str:
-        func_name = self._current_function.name if self._current_function else "<module>"
-        lineno = getattr(node, "lineno", -1)
-        col = getattr(node, "col_offset", -1)
-        return f"{func_name}:{lineno}:{col}"
+    def _node_location(self, node: ast.AST, op_name: str) -> NodeLocation:
+        return NodeLocation.from_ast(node, op_name, self._kernel_filename)
 
     def _value_to_ast(self, value: Any) -> ast.AST:
         if isinstance(value, LayoutMetadata):
@@ -665,8 +646,8 @@ class _CallMappingTransformer(ast.NodeTransformer):
         return None
 
     def _slice_layout_from_metadata(self, node: ast.Subscript) -> ast.expr | None:
-        node_key = self._node_lookup_key(node)
-        layout = self.ttgir_output.layouts.get(node_key)
+        location = self._node_location(node, "subscript")
+        layout = self.ttgir_output.get_layout(location, "layout")
         if isinstance(layout, SliceLayout):
             return self._layout_to_ast(layout)
         return None

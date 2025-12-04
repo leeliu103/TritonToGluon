@@ -160,7 +160,7 @@ _ensure_tensor_stubs()
 from src.codegen.generator import CodeGenerator, _call_graph_key
 from src.frontend.parser import CallDependency, ConstexprMetadata, ParsedKernel
 from src.mapping.function_registry import MappingFunctionRegistry, registry as builtin_registry
-from src.ttgir import TTGIROutput
+from src.ttgir import NodeLocation, NodeMetadata, TTGIROutput
 from triton.runtime import jit as triton_jit
 
 
@@ -267,15 +267,17 @@ def ttgir_output_factory() -> Callable[..., TTGIROutput]:
 
     def _factory(
         *,
-        layouts: Mapping[str, Any] | None = None,
-        spec_matches: Mapping[str, Any] | None = None,
-        diagnostics: Sequence[str] | None = None,
+        metadata: Mapping[NodeLocation, Any] | None = None,
     ) -> TTGIROutput:
-        return TTGIROutput(
-            layouts=layouts or {},
-            spec_matches=spec_matches or {},
-            diagnostics=diagnostics or tuple(),
-        )
+        normalized: dict[NodeLocation, NodeMetadata] = {}
+        for location, entry in (metadata or {}).items():
+            if isinstance(entry, NodeMetadata):
+                normalized[location] = entry
+            elif isinstance(entry, Mapping):
+                normalized[location] = NodeMetadata(layouts=dict(entry))
+            else:
+                normalized[location] = NodeMetadata(layouts={"layout": entry})
+        return TTGIROutput(metadata=normalized)
 
     return _factory
 

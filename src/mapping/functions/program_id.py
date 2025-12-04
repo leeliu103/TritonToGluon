@@ -8,9 +8,10 @@ from triton.experimental import gluon
 import triton.experimental.gluon as ttgl
 
 from ..function_registry import registry
+from ..metadata_schema import OpMetadataSpec
 
 
-@registry.register("program_id")
+@registry.register("program_id", schema=OpMetadataSpec(layouts=("layout",)))
 @gluon.jit
 def tl_program_id(
     axis: Any | None = None,

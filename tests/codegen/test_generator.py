@@ -9,19 +9,20 @@ import pytest
 
 from src.codegen.generator import _BASE_IMPORTS, _CallMappingTransformer, CodeGenerator
 from src.frontend.parser import ConstexprMetadata, ParsedKernel
+from src.ttgir import NodeLocation
 from triton.runtime import jit as triton_jit
 import triton.language.core as tlc
 
 
 @pytest.fixture
-def find_call_key() -> Callable[[ParsedKernel, Callable[[ast.Call], bool]], str]:
-    """Return a helper that extracts ``function:lineno:col`` keys for call nodes."""
+def find_call_location() -> Callable[[ParsedKernel, Callable[[ast.Call], bool], str], NodeLocation]:
+    """Return a helper that builds :class:`NodeLocation` entries for call nodes."""
 
-    def _finder(parsed_kernel: ParsedKernel, predicate: Callable[[ast.Call], bool]) -> str:
+    def _finder(parsed_kernel: ParsedKernel, predicate: Callable[[ast.Call], bool], op_name: str) -> NodeLocation:
         func_node = next(node for node in parsed_kernel.tree.body if isinstance(node, ast.FunctionDef))
         for node in ast.walk(func_node):
             if isinstance(node, ast.Call) and predicate(node):
-                return f"{func_node.name}:{node.lineno}:{node.col_offset}"
+                return NodeLocation.from_ast(node, op_name, parsed_kernel.filename)
         raise AssertionError("No matching call node found")
 
     return _finder
@@ -163,7 +164,7 @@ class TestCodeGenerator:
         parsed_kernel_factory: Callable[..., ParsedKernel],
         ttgir_output_factory: Callable[..., Any],
         layouts_module,
-        find_call_key: Callable[..., str],
+        find_call_location: Callable[..., NodeLocation],
     ) -> None:
         """Layout dataclasses become ttgl.* constructor calls in the emitted AST."""
 
@@ -179,14 +180,14 @@ class TestCodeGenerator:
             dim=0,
             parent=layouts_module.SharedLayout(axes=(0, 1)),
         )
-        arange_key = find_call_key(parsed, lambda node: getattr(node.func, "attr", "") == "arange")
+        arange_loc = find_call_location(parsed, lambda node: getattr(node.func, "attr", "") == "arange", "arange")
         func_node = next(node for node in parsed.tree.body if isinstance(node, ast.FunctionDef))
         slice_node = next(node for node in ast.walk(func_node) if isinstance(node, ast.Subscript))
-        slice_key = f"{func_node.name}:{slice_node.lineno}:{slice_node.col_offset}"
+        slice_loc = NodeLocation.from_ast(slice_node, "subscript", parsed.filename)
         ttgir_output = ttgir_output_factory(
-            layouts={
-                arange_key: {"layout": blocked_layout},
-                slice_key: slice_layout,
+            metadata={
+                arange_loc: {"layout": blocked_layout},
+                slice_loc: {"layout": slice_layout},
             }
         )
 
@@ -212,7 +213,6 @@ class TestCodeGenerator:
         )
         module = code_generator.generate(parsed, ttgir_output_factory())
         assert any("default_blocked_layout" in kernel.source for kernel in module.kernels)
-        assert any("Missing SliceLayout metadata" in diag for diag in module.diagnostics)
         assert any(
             line.startswith("from triton.tools.triton_to_gluon_translater.translator_helpers import")
             and "default_blocked_layout" in line
@@ -224,7 +224,7 @@ class TestCodeGenerator:
         code_generator: CodeGenerator,
         parsed_kernel_factory: Callable[..., ParsedKernel],
         ttgir_output_factory: Callable[..., Any],
-        find_call_key: Callable[..., str],
+        find_call_location: Callable[..., NodeLocation],
         layouts_module,
     ) -> None:
         """Mapped ops add helper imports while layout wrappers add support imports."""
@@ -241,15 +241,15 @@ class TestCodeGenerator:
             """,
         )
         blocked_layout = layouts_module.BlockedLayout(shape=(8,), order=(0,))
-        arange_key = find_call_key(parsed, lambda node: getattr(node.func, "attr", "") == "arange")
-        dot_key = find_call_key(parsed, lambda node: getattr(node.func, "attr", "") == "dot")
-        pid_key = find_call_key(parsed, lambda node: getattr(node.func, "attr", "") == "program_id")
-        layouts = {
-            arange_key: {"layout": blocked_layout},
-            dot_key: {"layout_a": blocked_layout, "layout_b": blocked_layout},
-            pid_key: {"layout": blocked_layout},
+        arange_loc = find_call_location(parsed, lambda node: getattr(node.func, "attr", "") == "arange", "arange")
+        dot_loc = find_call_location(parsed, lambda node: getattr(node.func, "attr", "") == "dot", "dot")
+        pid_loc = find_call_location(parsed, lambda node: getattr(node.func, "attr", "") == "program_id", "program_id")
+        metadata = {
+            arange_loc: {"layout": blocked_layout},
+            dot_loc: {"layout_a": blocked_layout, "layout_b": blocked_layout},
+            pid_loc: {"layout": blocked_layout},
         }
-        module = code_generator.generate(parsed, ttgir_output_factory(layouts=layouts))
+        module = code_generator.generate(parsed, ttgir_output_factory(metadata=metadata))
         helper_imports = {
             "from src.mapping.functions.arange import tl_arange",
             "from src.mapping.functions.dot import tl_dot",
@@ -267,7 +267,7 @@ class TestCodeGenerator:
         code_generator: CodeGenerator,
         parsed_kernel_factory: Callable[..., ParsedKernel],
         ttgir_output_factory: Callable[..., Any],
-        find_call_key: Callable[..., str],
+        find_call_location: Callable[..., NodeLocation],
         layouts_module,
     ) -> None:
         """JIT kernels gain @gluon.jit and tl.constexpr annotations become ttgl.constexpr."""
@@ -279,23 +279,23 @@ class TestCodeGenerator:
             """,
             is_jit=True,
         )
-        pid_key = find_call_key(parsed, lambda node: getattr(node.func, "attr", "") == "program_id")
+        pid_loc = find_call_location(parsed, lambda node: getattr(node.func, "attr", "") == "program_id", "program_id")
         blocked_layout = layouts_module.BlockedLayout(shape=(1,), order=(0,))
         module = code_generator.generate(
             parsed,
-            ttgir_output_factory(layouts={pid_key: {"layout": blocked_layout}}),
+            ttgir_output_factory(metadata={pid_loc: {"layout": blocked_layout}}),
         )
         kernel_source = module.kernels[0].source
         assert kernel_source.splitlines()[0] == "@gluon.jit"
         assert "x: ttgl.constexpr" in kernel_source
 
-    def test_unmapped_ops_preserve_tl_calls_and_report_diagnostics(
+    def test_unmapped_ops_preserve_tl_calls(
         self,
         code_generator: CodeGenerator,
         parsed_kernel_factory: Callable[..., ParsedKernel],
         ttgir_output_factory: Callable[..., Any],
     ) -> None:
-        """Unknown tl.* ops stay untouched and emit an unmapped diagnostic."""
+        """Unknown tl.* ops stay untouched and keep their imports."""
 
         parsed = parsed_kernel_factory(
             """
@@ -305,7 +305,6 @@ class TestCodeGenerator:
         )
         module = code_generator.generate(parsed, ttgir_output_factory())
         assert "tl.fake_op" in module.kernels[0].source
-        assert any("Unmapped Triton op" in diag for diag in module.diagnostics)
         assert "import triton.language as tl" in module.imports
 
     def test_empty_kernel_body_is_emitted(
@@ -325,14 +324,13 @@ class TestCodeGenerator:
         module = code_generator.generate(parsed, ttgir_output_factory())
         assert "pass" in module.kernels[0].source
 
-    def test_kernel_without_metadata_reports_missing_layout(
+    def test_kernel_without_metadata_emits_kernels(
         self,
         code_generator: CodeGenerator,
         parsed_kernel_factory: Callable[..., ParsedKernel],
         ttgir_output_factory: Callable[..., Any],
-        find_call_key: Callable[..., str],
     ) -> None:
-        """Missing TTGIR layout metadata surfaces a diagnostic."""
+        """Kernel generation succeeds even when TTGIR layout metadata is absent."""
 
         parsed = parsed_kernel_factory(
             """
@@ -341,7 +339,8 @@ class TestCodeGenerator:
             """
         )
         module = code_generator.generate(parsed, ttgir_output_factory())
-        assert any("Missing TTGIR metadata" in diag for diag in module.diagnostics)
+        assert module.kernels  # module still produces kernels
+        assert "tl_dot" in module.kernels[0].source
 
     def test_circular_call_graph_is_handled_without_duplicates(
         self,
@@ -380,7 +379,7 @@ class TestCodeGenerator:
         code_generator: CodeGenerator,
         parsed_kernel_factory: Callable[..., ParsedKernel],
         ttgir_output_factory: Callable[..., Any],
-        find_call_key: Callable[..., str],
+        find_call_location: Callable[..., NodeLocation],
         layouts_module,
     ) -> None:
         """Non-dataclass layout metadata triggers a TypeError for easier debugging."""
@@ -391,9 +390,9 @@ class TestCodeGenerator:
                 return tl.arange(0, 4)
             """
         )
-        call_key = find_call_key(parsed, lambda node: getattr(node.func, "attr", "") == "arange")
+        call_loc = find_call_location(parsed, lambda node: getattr(node.func, "attr", "") == "arange", "arange")
         invalid_layout = layouts_module.BlockedLayout(shape={1, 2}, order=(0,))
-        ttgir = ttgir_output_factory(layouts={call_key: {"layout": invalid_layout}})
+        ttgir = ttgir_output_factory(metadata={call_loc: {"layout": invalid_layout}})
         with pytest.raises(TypeError):
             code_generator.generate(parsed, ttgir)
 
@@ -402,7 +401,7 @@ class TestCodeGenerator:
         code_generator: CodeGenerator,
         parsed_kernel_factory: Callable[..., ParsedKernel],
         ttgir_output_factory: Callable[..., Any],
-        find_call_key: Callable[..., str],
+        find_call_location: Callable[..., NodeLocation],
         layouts_module,
     ) -> None:
         """Gluon modules can be unparsed and re-parsed as valid Python."""
@@ -417,13 +416,13 @@ class TestCodeGenerator:
             """,
             is_jit=True,
         )
-        arange_key = find_call_key(parsed, lambda node: getattr(node.func, "attr", "") == "arange")
-        pid_key = find_call_key(parsed, lambda node: getattr(node.func, "attr", "") == "program_id")
+        arange_loc = find_call_location(parsed, lambda node: getattr(node.func, "attr", "") == "arange", "arange")
+        pid_loc = find_call_location(parsed, lambda node: getattr(node.func, "attr", "") == "program_id", "program_id")
         blocked_layout = layouts_module.BlockedLayout(shape=(8,), order=(0,))
         ttgir = ttgir_output_factory(
-            layouts={
-                arange_key: {"layout": blocked_layout},
-                pid_key: {"layout": blocked_layout},
+            metadata={
+                arange_loc: {"layout": blocked_layout},
+                pid_loc: {"layout": blocked_layout},
             }
         )
         module = code_generator.generate(parsed, ttgir)
@@ -441,15 +440,14 @@ class TestCallMappingTransformer:
         mapping_registry_factory: Callable[[], Any],
         *,
         is_jit: bool = False,
-        layouts: dict[str, Any] | None = None,
-        spec_matches: dict[str, Any] | None = None,
+        metadata: dict[NodeLocation, Any] | None = None,
         globals_extra: dict[str, Any] | None = None,
     ) -> tuple[_CallMappingTransformer, ParsedKernel]:
         parsed = parsed_kernel_factory(source, is_jit=is_jit, globals_extra=globals_extra)
         registry = mapping_registry_factory()
         transformer = _CallMappingTransformer(
             parsed_kernel=parsed,
-            ttgir_output=ttgir_output_factory(layouts=layouts or {}, spec_matches=spec_matches or {}),
+            ttgir_output=ttgir_output_factory(metadata=metadata or {}),
             registry=registry,
             is_jit=is_jit,
         )
@@ -460,7 +458,7 @@ class TestCallMappingTransformer:
         parsed_kernel_factory: Callable[..., ParsedKernel],
         ttgir_output_factory: Callable[..., Any],
         mapping_registry_factory: Callable[[], Any],
-        find_call_key: Callable[..., str],
+        find_call_location: Callable[..., NodeLocation],
         layouts_module,
     ) -> None:
         """Mapped Triton ops become helper calls with metadata keywords."""
@@ -474,13 +472,13 @@ class TestCallMappingTransformer:
             """
         )
         blocked_layout = layouts_module.BlockedLayout(shape=(4,), order=(0,))
-        arange_key = find_call_key(key_kernel, lambda node: getattr(node.func, "attr", "") == "arange")
-        dot_key = find_call_key(key_kernel, lambda node: getattr(node.func, "attr", "") == "dot")
-        pid_key = find_call_key(key_kernel, lambda node: getattr(node.func, "attr", "") == "program_id")
-        layouts = {
-            arange_key: {"layout": blocked_layout},
-            dot_key: {"layout_a": blocked_layout, "layout_b": blocked_layout},
-            pid_key: {"layout": blocked_layout},
+        arange_loc = find_call_location(key_kernel, lambda node: getattr(node.func, "attr", "") == "arange", "arange")
+        dot_loc = find_call_location(key_kernel, lambda node: getattr(node.func, "attr", "") == "dot", "dot")
+        pid_loc = find_call_location(key_kernel, lambda node: getattr(node.func, "attr", "") == "program_id", "program_id")
+        metadata = {
+            arange_loc: {"layout": blocked_layout},
+            dot_loc: {"layout_a": blocked_layout, "layout_b": blocked_layout},
+            pid_loc: {"layout": blocked_layout},
         }
         transformer, parsed_kernel = self._build_transformer(
             """
@@ -492,7 +490,7 @@ class TestCallMappingTransformer:
             parsed_kernel_factory,
             ttgir_output_factory,
             mapping_registry_factory,
-            layouts=layouts,
+            metadata=metadata,
         )
         transformed = transformer.visit(ast.fix_missing_locations(parsed_kernel.tree))
         text = ast.unparse(transformed)
@@ -507,7 +505,7 @@ class TestCallMappingTransformer:
         ttgir_output_factory: Callable[..., Any],
         mapping_registry_factory: Callable[[], Any],
     ) -> None:
-        """Unknown calls stay as tl.* expressions and report diagnostics."""
+        """Unknown calls stay as tl.* expressions."""
 
         transformer, parsed = self._build_transformer(
             """
@@ -520,7 +518,6 @@ class TestCallMappingTransformer:
         )
         transformed = transformer.visit(ast.fix_missing_locations(parsed.tree))
         assert "tl.unknown" in ast.unparse(transformed)
-        assert transformer.diagnostics
 
     def test_visit_attribute_rewrites_dtype_and_tensor_descriptor(
         self,
@@ -609,12 +606,14 @@ class TestCallMappingTransformer:
         )
         func_node = next(node for node in parsed.tree.body if isinstance(node, ast.FunctionDef))
         subscript = next(node for node in ast.walk(func_node) if isinstance(node, ast.Subscript))
-        key = f"{func_node.name}:{subscript.lineno}:{subscript.col_offset}"
-        layouts = {
-            key: layouts_module.SliceLayout(
-                dim=0,
-                parent=layouts_module.SharedLayout(axes=(0, 1)),
-            )
+        slice_loc = NodeLocation.from_ast(subscript, "subscript", parsed.filename)
+        metadata = {
+            slice_loc: {
+                "layout": layouts_module.SliceLayout(
+                    dim=0,
+                    parent=layouts_module.SharedLayout(axes=(0, 1)),
+                )
+            }
         }
         transformer, parsed = self._build_transformer(
             """
@@ -624,7 +623,7 @@ class TestCallMappingTransformer:
             parsed_kernel_factory,
             ttgir_output_factory,
             mapping_registry_factory,
-            layouts=layouts,
+            metadata=metadata,
         )
         transformed = transformer.visit(ast.fix_missing_locations(parsed.tree))
         assert "ttgl.convert_layout" in ast.unparse(transformed)

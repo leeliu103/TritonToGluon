@@ -12,9 +12,10 @@ from triton.tools.triton_to_gluon_translater.translator_helpers import (
 )
 
 from ..function_registry import registry
+from ..metadata_schema import OpMetadataSpec
 
 
-@registry.register("dot")
+@registry.register("dot", schema=OpMetadataSpec(layouts=("layout_a", "layout_b")))
 @gluon.jit
 def tl_dot(
     a: Any,
@@ -32,7 +33,7 @@ def tl_dot(
     return upstream_tl_dot(a, b, acc, input_precision=input_precision, **kwargs)
 
 
-@registry.register("dot_scaled")
+@registry.register("dot_scaled", schema=OpMetadataSpec(layouts=("layout_a", "layout_b")))
 @gluon.jit
 def tl_dot_scaled(
     a: Any,

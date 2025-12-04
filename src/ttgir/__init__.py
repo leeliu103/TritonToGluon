@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .extractor import TTGIRExtractor, TTGIROutput
+from .extractor import NodeMetadata, TTGIRExtractor, TTGIROutput
 from .layouts import (
     AutoLayout,
     BlockedLayout,
@@ -10,7 +10,6 @@ from .layouts import (
     DistributedLayout,
     DistributedLinearLayout,
     DotOperandLayout,
-    LayoutMap,
     LayoutMetadata,
     NVMMADistributedLayout,
     NVMMASharedLayout,
@@ -20,10 +19,12 @@ from .layouts import (
     SliceLayout,
     SwizzledSharedLayout,
 )
+from .location import NodeLocation
 
 __all__ = [
+    "NodeLocation",
+    "NodeMetadata",
     "LayoutMetadata",
-    "LayoutMap",
     "AutoLayout",
     "BlockedLayout",
     "CoalescedLayout",

@@ -5,19 +5,29 @@ from __future__ import annotations
 import importlib
 from typing import Any, Callable, Dict, Iterable, Optional
 
+from .metadata_schema import OpMetadataSpec
+
 
 class MappingFunctionRegistry:
     """Registry that maps Triton op names to Gluon helper callables."""
 
     def __init__(self) -> None:
         self._functions: Dict[str, Callable[..., Any]] = {}
+        self._schemas: Dict[str, OpMetadataSpec] = {}
         self._builtins_loaded = False
 
-    def register(self, triton_op: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def register(
+        self,
+        triton_op: str,
+        *,
+        schema: OpMetadataSpec | None = None,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator used by mapping modules to register helper functions."""
 
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             self._functions[triton_op] = func
+            if schema is not None:
+                self._schemas[triton_op] = schema
             return func
 
         return decorator
@@ -26,6 +36,11 @@ class MappingFunctionRegistry:
         """Return the helper function registered for ``triton_op``."""
 
         return self._functions.get(triton_op)
+
+    def get_schema(self, triton_op: str) -> OpMetadataSpec | None:
+        """Return the metadata schema registered for ``triton_op``."""
+
+        return self._schemas.get(triton_op)
 
     def get_import_path(self, triton_op: str) -> Optional[str]:
         """Return an import statement for the helper registered to ``triton_op``."""
