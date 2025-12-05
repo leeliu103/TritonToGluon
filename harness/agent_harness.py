@@ -8,15 +8,13 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import anyio
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ResultMessage,
-    TextBlock,
-    query,
+from shared.agent_shared import (
+    build_default_codex_options,
+    invoke_agent,
+    log_parse_failure_details,
 )
 
 
@@ -93,28 +91,7 @@ class HarnessAgent:
     ) -> None:
         self.prompt_builder = prompt_builder or HarnessPromptBuilder()
         self.response_parser = response_parser or HarnessResponseParser()
-        self.codex_options = ClaudeAgentOptions(
-            allowed_tools=["mcp__codex", "Read", "Grep"],
-            mcp_servers={
-                "codex": {
-                    "type": "stdio",
-                    "command": "npx",
-                    "args": [
-                        "-y",
-                        "@openai/codex",
-                        "-c",
-                        'model_provider="amd-openai"',
-                        "mcp-server",
-                    ],
-                }
-            },
-            system_prompt=(
-                "You are a careful systems engineer. "
-                "Respond with a single JSON object that matches the caller's schema. "
-                "Do not include markdown fences or commentary."
-            ),
-            max_turns=15,
-        )
+        self.codex_options = build_default_codex_options()
 
     async def generate_harness(self, kernel_path: str) -> HarnessGenerationResult:
         if not kernel_path:
@@ -125,48 +102,19 @@ class HarnessAgent:
             raise FileNotFoundError(f"Kernel file not found: {normalized_path}")
 
         prompt = self.prompt_builder.build_prompt(normalized_path)
-        response_text, query_error = await self._invoke_agent(prompt, normalized_path)
+        response_text, query_error = await invoke_agent(
+            prompt, self.codex_options, normalized_path
+        )
 
         try:
             return self.response_parser.parse(response_text)
-        except ValueError as exc:
-            if query_error:
-                print(
-                    f"Warning: Agent query failed for {normalized_path}: {query_error}",
-                    file=sys.stderr,
-                )
-            snippet = response_text.replace("\n", " ")[:400] if response_text else ""
-            if snippet:
-                print(f"Agent response snippet: {snippet}...", file=sys.stderr)
+        except ValueError:
+            log_parse_failure_details(
+                context_label=normalized_path,
+                query_error=query_error,
+                agent_response=response_text,
+            )
             raise
-
-    async def _invoke_agent(self, prompt: str, kernel_path: str) -> Tuple[str, Optional[Exception]]:
-        response_text = ""
-        query_error: Optional[Exception] = None
-
-        try:
-            async for message in query(prompt=prompt, options=self.codex_options):
-                if isinstance(message, AssistantMessage):
-                    blocks = getattr(message, "content", None) or []
-                    response_text += "".join(
-                        block.text for block in blocks if isinstance(block, TextBlock)
-                    )
-                elif isinstance(message, ResultMessage):
-                    blocks = getattr(message, "content", None) or []
-                    response_text += "".join(
-                        block.text for block in blocks if isinstance(block, TextBlock)
-                    )
-                    payload = getattr(message, "result", None)
-                    if payload:
-                        if isinstance(payload, str):
-                            response_text += payload
-                        else:
-                            response_text += json.dumps(payload)
-        except Exception as exc:  # pragma: no cover - guard against agent issues
-            query_error = exc
-            print(f"Warning: Agent streaming failed for {kernel_path}: {exc}", file=sys.stderr)
-
-        return response_text, query_error
 
 
 def write_harness_script(script_text: str, output_path: str) -> str:
