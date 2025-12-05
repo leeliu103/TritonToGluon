@@ -116,6 +116,14 @@ class ConfigAgent:
             prompt, self.codex_options, normalized_path
         )
 
+        if query_error:
+            log_parse_failure_details(
+                context_label=normalized_path,
+                query_error=query_error,
+                agent_response=response_text,
+            )
+            raise query_error
+
         try:
             return self.response_parser.parse(response_text)
         except ValueError:
