@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from typing import List, Optional, Tuple
 
@@ -19,6 +20,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "Respond with a single JSON object that matches the caller's schema. "
     "Do not include markdown fences or commentary."
 )
+
+_CODE_FENCE_PATTERN = re.compile(r"```(?:[a-zA-Z0-9_-]+)?")
 
 
 def build_default_codex_options(
@@ -96,3 +99,27 @@ def log_parse_failure_details(
     snippet = agent_response.replace("\n", " ")[:400] if agent_response else ""
     if snippet:
         print(f"Agent response snippet: {snippet}...", file=sys.stderr)
+
+
+def strip_markdown_code_fences(text: str) -> str:
+    """Remove markdown-style code fences (e.g., ```json ... ```) from text."""
+    if not text:
+        return ""
+    return _CODE_FENCE_PATTERN.sub("", text)
+
+
+def extract_first_json_object(text: str) -> str:
+    """Return the first JSON object found in text after removing code fences."""
+    cleaned = strip_markdown_code_fences(text or "")
+    json_start = cleaned.find("{")
+    if json_start == -1:
+        raise ValueError("Agent response did not contain a JSON object")
+
+    decoder = json.JSONDecoder()
+    tail = cleaned[json_start:]
+    try:
+        _, end_index = decoder.raw_decode(tail)
+    except json.JSONDecodeError as exc:  # pragma: no cover - defensive parsing
+        raise ValueError("Failed to decode JSON object from agent response") from exc
+
+    return tail[:end_index]

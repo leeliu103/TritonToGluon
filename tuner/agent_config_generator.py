@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import anyio
 from shared.agent_shared import (
     build_default_codex_options,
+    extract_first_json_object,
     invoke_agent,
     log_parse_failure_details,
 )
@@ -88,7 +89,8 @@ class ConfigResponseParser:
     """Parses the JSON payload emitted by the config agent."""
 
     def parse(self, raw_response: str) -> ConfigGenerationResult:
-        data = json.loads(raw_response.strip())
+        json_str = extract_first_json_object(raw_response)
+        data = json.loads(json_str)
         if not isinstance(data, dict):
             raise ValueError("Agent response must be a JSON object")
 
