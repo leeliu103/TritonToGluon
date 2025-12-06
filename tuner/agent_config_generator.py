@@ -28,12 +28,13 @@ CONFIG_AGENT_SYSTEM_PROMPT = (
     "2. Identify the algorithm type (matmul, reduction, elementwise, attention, etc.) and summarize the control flow, indexing math, and data shapes purely from what the kernel computes.\n"
     "3. Note relationships between parameters and problem sizes that must hold (e.g., BLOCK_M divides M, BLOCK_SIZE matches stride requirements) and capture any tl.static_assert or boundary-guard logic.\n"
     "4. Apply practical GPU heuristics tied to the stated architecture—warp granularity (32 NVIDIA / 64 AMD), preference for powers of two, balanced tile aspect ratios, reasonable num_warps/num_stages combos—only insofar as they align with the visible code constraints.\n"
-    "5. Design a diverse set of candidate configs (small/medium/large tiles, varying warp/stage counts) that all satisfy the kernel's requirements and would provide meaningful coverage for autotuning.\n"
-    "6. Explain the intent of the configs using references to the kernel's logic (e.g., loop bounds, tensor blocking) rather than unverifiable hardware speculation.\n"
+    "5. Determine an appropriate number of configs (typically 5-20) by weighing the count of tunable knobs, the breadth of their valid ranges, kernel complexity, and expected autotuning coverage.\n"
+    "6. Design that many diverse candidate configs (small/medium/large tiles, varying warp/stage counts) that all satisfy the kernel's requirements and would provide meaningful coverage for autotuning.\n"
+    "7. Explain the intent of the configs using references to the kernel's logic (e.g., loop bounds, tensor blocking) rather than unverifiable hardware speculation.\n"
     "Response requirements:\n"
     "- Produce exactly one JSON object containing a `configs` list and an optional `notes` string summarizing the explored trade-offs.\n"
     "- Each config dictionary must map the kernel's compile-time parameters to concrete integers that respect the kernel constraints and basic hardware heuristics.\n"
-    "- Generate exactly the number of configs requested and keep them mutually informative.\n"
+    "- Justify the chosen config count inside the `notes` field and ensure the number of emitted configs matches that justification.\n"
     "- Do not include markdown fences, commentary outside the JSON object, or extra keys."
 )
 
@@ -58,28 +59,29 @@ class ConfigGenerationResult:
 class ConfigPromptBuilder:
     """Builds prompts for the config-generation agent."""
 
-    def build_prompt(self, kernel_path: str, gpu_arch: str, num_candidates: int) -> str:
+    def build_prompt(self, kernel_path: str, gpu_arch: str) -> str:
         kernel_path = os.path.abspath(kernel_path)
         template = (
             "Prepare Triton tuning configs for the specified kernel.\n"
             f"Target kernel path: {kernel_path}\n"
             f"Target GPU architecture: {gpu_arch}\n"
-            f"Required number of configs: {num_candidates}\n"
             "Follow this step-by-step process:\n"
             "1. Use Codex MCP filesystem tools (read_file, read_directory, rg) to open the kernel at the provided path. Confirm the function signature, @triton.jit decorator arguments, and every tl.constexpr parameter or module-level constant.\n"
             "2. List every compile-time/tunable knob the kernel exposes (BLOCK_SIZE, TILE_M/N/K, GROUP_SIZE_M, VECTOR_WIDTH, num_warps, num_stages, etc.) along with any constraints stated in the code (assertions, tl.static_assert, divisibility rules, boundary guards).\n"
             "3. Describe the algorithm purely from the visible source: tensor shapes, indexing math, loop structure, tl.load/tl.store usage, and synchronization that appears in the code. Avoid speculation about compiler-inserted behavior.\n"
             "4. Derive valid ranges or preferred patterns for each tunable using the observed relationships plus basic GPU heuristics for the specified architecture (warp multiples of 32/64, powers-of-two tile sizes, practical num_warps/num_stages combinations).\n"
-            "5. Propose exactly {num_candidates} distinct configs that respect every visible constraint and cover diverse tile scales or warp/stage selections so the tuner can explore different regions.\n"
-            "6. Summarize notable trade-offs or assumptions in a short notes string, citing the kernel logic (loop bounds, pointer math, guards) that guided each choice.\n"
+            "5. Decide how many configs to emit (typically 5-20) by weighing the number of tunables, the breadth of their valid ranges, kernel complexity, and expected autotuning coverage. Do not guess—justify the count using facts from the source and practical heuristics.\n"
+            "6. Produce that many distinct configs that respect every visible constraint and cover diverse tile scales or warp/stage selections so the tuner can explore different regions.\n"
+            "7. Summarize notable trade-offs or assumptions in a short notes string, explicitly explaining why the selected config count is appropriate for this kernel.\n"
             "Do not attempt to infer register counts, cache hit rates, or memory-stage movement beyond what the source explicitly expresses.\n"
             "Output instructions:\n"
             "- Return exactly one JSON object with:\n"
             "{\n"
-            f'  "configs": [<exactly {num_candidates} config dicts>],\n'
-            '  "notes": "Brief rationale covering trade-offs and code-backed considerations."\n'
+            '  "configs": [<config dicts equal to the justified count>],\n'
+            '  "notes": "Brief rationale covering trade-offs, knob constraints, and the reasoning behind the chosen count."\n'
             "}\n"
             "- Each config dictionary must fill in every relevant compile-time knob with concrete integers tailored to the kernel; omit knobs that are not declared.\n"
+            "- The number of configs emitted must match the count defended in `notes`.\n"
             "- Do not include markdown fences, commentary, or extra keys."
         )
         return template
@@ -129,22 +131,18 @@ class ConfigAgent:
         )
 
     async def generate_configs(
-        self, kernel_path: str, gpu_arch: str, num_candidates: int
+        self, kernel_path: str, gpu_arch: str
     ) -> ConfigGenerationResult:
         if not kernel_path:
             raise ValueError("kernel_path is required")
         if not gpu_arch:
             raise ValueError("gpu_arch is required")
-        if num_candidates <= 0:
-            raise ValueError("num_candidates must be positive")
 
         normalized_path = os.path.abspath(kernel_path)
         if not os.path.exists(normalized_path):
             raise FileNotFoundError(f"Kernel file not found: {normalized_path}")
 
-        prompt = self.prompt_builder.build_prompt(
-            normalized_path, gpu_arch, num_candidates
-        )
+        prompt = self.prompt_builder.build_prompt(normalized_path, gpu_arch)
         response_text, query_error = await invoke_agent(
             prompt, self.codex_options, normalized_path
         )
@@ -201,12 +199,6 @@ def _parse_args() -> argparse.Namespace:
         help="GPU architecture identifier (e.g., rdna4, rdna3, mi300) to target tuning heuristics.",
     )
     parser.add_argument(
-        "--num-candidates",
-        type=int,
-        required=True,
-        help="Exact number of config candidates to request from the agent.",
-    )
-    parser.add_argument(
         "--output",
         default=None,
         help=(
@@ -222,8 +214,6 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.output:
         args.output = derive_default_output_path(args.kernel_path)
-    if args.num_candidates <= 0:
-        raise ValueError("--num-candidates must be a positive integer")
     return args
 
 
@@ -232,7 +222,7 @@ def _run_cli() -> None:
     agent = ConfigAgent()
     print(
         (
-            f"Generating {args.num_candidates} configs for kernel: {args.kernel_path} "
+            f"Generating configs for kernel: {args.kernel_path} "
             f"(GPU arch: {args.gpu_arch})"
         ),
         file=sys.stderr,
@@ -241,7 +231,6 @@ def _run_cli() -> None:
         agent.generate_configs,
         args.kernel_path,
         args.gpu_arch,
-        args.num_candidates,
     )
 
     saved_path = write_config_file(result.configs, args.output)
