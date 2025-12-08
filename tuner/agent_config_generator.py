@@ -7,7 +7,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 import anyio
@@ -20,21 +20,25 @@ from shared.agent_shared import (
 
 
 CONFIG_AGENT_SYSTEM_PROMPT = (
+    "CRITICAL: You MUST use Codex MCP for ALL analysis and generation."
+    "Never rely on assumptions or prior knowledge—read the actual source code using Codex tools before making ANY decisions about parameters, shapes, or configs. "
+    "Every conclusion must be grounded in observable facts from the files you read with Codex tools.\n"
     "You are a principal GPU kernel performance engineer and Triton autotuning specialist. "
     "Always begin by opening the referenced Triton kernel with Codex MCP filesystem tools (read_file, rg) and study the code until every decorator, function parameter, tl.constexpr knob, loop, and tl.load/store is understood. "
-    "Base every conclusion strictly on facts visible in the source—do not speculate about compiler lowering, cache behavior, or register usage unless the code states it explicitly.\n"
+    "Base every conclusion strictly on facts visible in the source—do not speculate about compiler lowering, cache behavior, or register usage unless the code states it explicitly. "
+    "For each config, specify ALL compile-time parameters: BLOCK_SIZE, num_stages, num_warps, and any other kernel-specific tunables. "
+    "Do NOT omit num_warps—it is a critical launch parameter that affects performance.\n"
     "Methodology:\n"
-    "1. Catalog all tunable/constexpr parameters (BLOCK_SIZE, TILE_M/N/K, GROUP_SIZE, VECTOR_WIDTH, num_warps, num_stages, etc.), their defaults, and any constraints expressed in the code (assertions, divisibility, min/max values).\n"
-    "2. Identify the algorithm type (matmul, reduction, elementwise, attention, etc.) and summarize the control flow, indexing math, and data shapes purely from what the kernel computes.\n"
-    "3. Note relationships between parameters and problem sizes that must hold (e.g., BLOCK_M divides M, BLOCK_SIZE matches stride requirements) and capture any tl.static_assert or boundary-guard logic.\n"
-    "4. Apply practical GPU heuristics tied to the stated architecture—warp granularity (32 NVIDIA / 64 AMD), preference for powers of two, balanced tile aspect ratios, reasonable num_warps/num_stages combos—only insofar as they align with the visible code constraints.\n"
-    "5. Determine an appropriate number of configs (typically 5-20) by weighing the count of tunable knobs, the breadth of their valid ranges, kernel complexity, and expected autotuning coverage.\n"
-    "6. Design that many diverse candidate configs (small/medium/large tiles, varying warp/stage counts) that all satisfy the kernel's requirements and would provide meaningful coverage for autotuning.\n"
-    "7. Explain the intent of the configs using references to the kernel's logic (e.g., loop bounds, tensor blocking) rather than unverifiable hardware speculation.\n"
+    "1. Catalog every tunable/constexpr parameter along with explicit constraints from the source (assertions, divisibility, boundary guards).\n"
+    "2. Summarize the algorithm, tensor shapes, indexing math, and synchronization exactly as implemented—no hypothetical behavior.\n"
+    "3. Relate tunable knobs to problem sizes so you know when tiles, BLOCK_SIZE, or num_warps should scale with batch/sequence dimensions.\n"
+    "4. Apply GPU-specific heuristics tied to the requested architecture (e.g., RDNA warp granularity of 64, powers-of-two shapes, realistic num_warps/num_stages combinations).\n"
+    "5. Design 3-5 representative workloads that cover distinct real-world scenarios (small/medium/large batches, varying sequence lengths, etc.) and articulate how each stresses the kernel differently.\n"
+    "6. For every workload, craft several configs that satisfy kernel constraints, align with the workload's tensor sizes, and leverage the target GPU architecture.\n"
     "Response requirements:\n"
-    "- Produce exactly one JSON object containing a `configs` list and an optional `notes` string summarizing the explored trade-offs.\n"
-    "- Each config dictionary must map the kernel's compile-time parameters to concrete integers that respect the kernel constraints and basic hardware heuristics.\n"
-    "- Justify the chosen config count inside the `notes` field and ensure the number of emitted configs matches that justification.\n"
+    "- Return exactly one JSON object with keys: `kernel_name`, `gpu_arch`, and `workloads`.\n"
+    "- Each workload must include: `name`, `input_shapes`, `output_shapes`, `dtypes`, and a `configs` list containing architecture-aware knob dictionaries.\n"
+    "- BLOCK_SIZE (or analogous tiling knobs) should be adapted to the workload's problem dimensions so that small workloads use smaller tiles than large ones.\n"
     "- Do not include markdown fences, commentary outside the JSON object, or extra keys."
 )
 
@@ -49,11 +53,24 @@ def derive_default_output_path(kernel_path: str) -> str:
 
 
 @dataclass
-class ConfigGenerationResult:
-    """In-memory representation of the config agent response."""
+class WorkloadSpec:
+    """Description of a representative workload and its tailored configs."""
 
+    name: str
+    input_shapes: Dict[str, List[int]]
+    output_shapes: Dict[str, List[int]]
+    dtypes: Dict[str, str]
     configs: List[Dict[str, Any]]
-    notes: str = ""
+    best_config: Optional[Dict[str, Any]] = None  # Added by harness after autotuning; reset to None when regenerating configs.
+
+
+@dataclass
+class ConfigGenerationResult:
+    """In-memory representation of the workload-aware response."""
+
+    kernel_name: str
+    gpu_arch: str
+    workloads: List[WorkloadSpec]
 
 
 class ConfigPromptBuilder:
@@ -62,26 +79,55 @@ class ConfigPromptBuilder:
     def build_prompt(self, kernel_path: str, gpu_arch: str) -> str:
         kernel_path = os.path.abspath(kernel_path)
         template = (
-            "Prepare Triton tuning configs for the specified kernel.\n"
+            "Prepare workload-aware Triton tuning configs for the specified kernel.\n"
             f"Target kernel path: {kernel_path}\n"
             f"Target GPU architecture: {gpu_arch}\n"
-            "Follow this step-by-step process:\n"
-            "1. Use Codex MCP filesystem tools (read_file, read_directory, rg) to open the kernel at the provided path. Confirm the function signature, @triton.jit decorator arguments, and every tl.constexpr parameter or module-level constant.\n"
-            "2. List every compile-time/tunable knob the kernel exposes (BLOCK_SIZE, TILE_M/N/K, GROUP_SIZE_M, VECTOR_WIDTH, num_warps, num_stages, etc.) along with any constraints stated in the code (assertions, tl.static_assert, divisibility rules, boundary guards).\n"
-            "3. Describe the algorithm purely from the visible source: tensor shapes, indexing math, loop structure, tl.load/tl.store usage, and synchronization that appears in the code. Avoid speculation about compiler-inserted behavior.\n"
-            "4. Derive valid ranges or preferred patterns for each tunable using the observed relationships plus basic GPU heuristics for the specified architecture (warp multiples of 32/64, powers-of-two tile sizes, practical num_warps/num_stages combinations).\n"
-            "5. Decide how many configs to emit (typically 5-20) by weighing the number of tunables, the breadth of their valid ranges, kernel complexity, and expected autotuning coverage. Do not guess—justify the count using facts from the source and practical heuristics.\n"
-            "6. Produce that many distinct configs that respect every visible constraint and cover diverse tile scales or warp/stage selections so the tuner can explore different regions.\n"
-            "7. Summarize notable trade-offs or assumptions in a short notes string, explicitly explaining why the selected config count is appropriate for this kernel.\n"
-            "Do not attempt to infer register counts, cache hit rates, or memory-stage movement beyond what the source explicitly expresses.\n"
-            "Output instructions:\n"
-            "- Return exactly one JSON object with:\n"
+            "Follow this process:\n"
+            "1. Use Codex MCP filesystem tools (read_file, rg) to fully inspect the kernel:\n"
+            "   - Read the kernel source file completely\n"
+            "   - Identify ALL @triton.jit functions\n"
+            "   - List ALL tl.constexpr parameters (BLOCK_SIZE, num_stages, num_warps, etc.)\n"
+            "   - Find ALL assertions, guards, or constraints in the code\n"
+            "   CRITICAL: Do this using Codex tools—never assume or guess the kernel structure.\n"
+            "2. Describe how tensor dimensions flow through the kernel (loops, indexing, blocking, tl.load/tl.store) purely from source evidence. Pay attention to how BLOCK_SIZE, TILE sizes, num_warps, and num_stages interact with batch/sequence lengths.\n"
+            "3. Derive ranges or preferred multiples for each tunable knob using code constraints plus GPU-specific heuristics for the requested architecture (warp granularity, LDS usage limits, etc.).\n"
+            "4. Propose 3-5 representative workloads that capture distinct real deployments (e.g., small_batch, medium_batch, long_sequence). Each workload must highlight different tensor shapes or batch/sequence lengths so autotuning can reason about scaling.\n"
+            "5. For every workload, specify: a descriptive name, input_shapes (dict of parameter -> shape list), output_shapes, and dtypes using torch dtype strings. Then craft 2-4 configs whose BLOCK_SIZE/tiling choices are a tight fit for that workload's tensor dimensions and GPU architecture. Larger workloads should prefer larger tiles than smaller workloads.\n"
+            "6. Reference the kernel's actual tunables only; do not invent knobs. Every config must include num_warps (typically 2, 4, 8, or 16 for RDNA GPUs) and you must choose num_warps based on occupancy and register pressure for each BLOCK_SIZE. Reject configs that violate tl.static_assert or divisibility requirements.\n"
+            "Output requirements:\n"
+            "- Emit exactly one JSON object matching:\n"
             "{\n"
-            '  "configs": [<config dicts equal to the justified count>],\n'
-            '  "notes": "Brief rationale covering trade-offs, knob constraints, and the reasoning behind the chosen count."\n'
+            '  "kernel_name": "fused_softmax_kernel",\n'
+            '  "gpu_arch": "' + gpu_arch + '",\n'
+            '  "workloads": [\n'
+            '    {\n'
+            '      "name": "small_batch",\n'
+            '      "input_shapes": {"x": [1024, 256]},\n'
+            '      "output_shapes": {"y": [1024, 256]},\n'
+            '      "dtypes": {"x": "torch.float16", "y": "torch.float16"},\n'
+            '      "configs": [\n'
+            '        {"BLOCK_SIZE": 128, "num_stages": 2, "num_warps": 2},\n'
+            '        {"BLOCK_SIZE": 256, "num_stages": 3, "num_warps": 4}\n'
+            '      ]\n'
+            '    },\n'
+            '    {\n'
+            '      "name": "long_sequence",\n'
+            '      "input_shapes": {"q": [4096, 512], "k": [4096, 512]},\n'
+            '      "output_shapes": {"attn": [4096, 512]},\n'
+            '      "dtypes": {"q": "torch.float16", "k": "torch.float16", "attn": "torch.float16"},\n'
+            '      "configs": [\n'
+            '        {"BLOCK_SIZE": 256, "num_stages": 2, "num_warps": 4},\n'
+            '        {"BLOCK_SIZE": 512, "num_stages": 3, "num_warps": 8},\n'
+            '        {"BLOCK_SIZE": 1024, "num_stages": 3, "num_warps": 16}\n'
+            '      ]\n'
+            '    }\n'
+            '  ]\n'
             "}\n"
-            "- Each config dictionary must fill in every relevant compile-time knob with concrete integers tailored to the kernel; omit knobs that are not declared.\n"
-            "- The number of configs emitted must match the count defended in `notes`.\n"
+            "- Do not use ellipses (...) or placeholder text in the JSON output.\n"
+            "- Every list must contain complete, concrete objects.\n"
+            "- kernel_name must match the actual Triton function implemented at the provided path.\n"
+            "- workload configs must be GPU-specific, satisfy kernel constraints, and should align BLOCK_SIZE (or analogous tiles) with the workload's tensor sizes.\n"
+            "- Every config dictionary must include BLOCK_SIZE, num_stages, num_warps, and any other kernel-specific compile-time knobs derived directly from the code. Do NOT omit num_warps—it must come from Codex-driven evidence.\n"
             "- Do not include markdown fences, commentary, or extra keys."
         )
         return template
@@ -96,24 +142,158 @@ class ConfigResponseParser:
         if not isinstance(data, dict):
             raise ValueError("Agent response must be a JSON object")
 
-        configs = data.get("configs")
-        if not isinstance(configs, list) or not configs:
-            raise ValueError("Agent response must include a non-empty 'configs' list")
+        kernel_name = self._validate_non_empty_str(data.get("kernel_name"), "kernel_name")
+        gpu_arch = self._validate_non_empty_str(data.get("gpu_arch"), "gpu_arch")
 
-        normalized_configs: List[Dict[str, Any]] = []
-        for entry in configs:
-            if not isinstance(entry, dict) or not entry:
-                raise ValueError("Each config must be a non-empty JSON object")
-            normalized_configs.append({str(k): entry[k] for k in entry})
+        workloads_data = data.get("workloads")
+        if not isinstance(workloads_data, list) or not workloads_data:
+            raise ValueError("Agent response must include a non-empty 'workloads' list")
 
-        notes = data.get("notes", "")
-        if notes is None:
-            notes = ""
+        workloads: List[WorkloadSpec] = []
+        for idx, workload_entry in enumerate(workloads_data):
+            if not isinstance(workload_entry, dict):
+                raise ValueError(f"Workload #{idx} must be a JSON object")
+
+            workload_name = self._validate_non_empty_str(
+                workload_entry.get("name"), f"workloads[{idx}].name"
+            )
+            input_shapes = self._validate_shapes_map(
+                workload_entry.get("input_shapes"),
+                f"workloads[{idx}].input_shapes",
+            )
+            output_shapes = self._validate_shapes_map(
+                workload_entry.get("output_shapes"),
+                f"workloads[{idx}].output_shapes",
+            )
+            dtypes = self._validate_dtypes_map(
+                workload_entry.get("dtypes"), f"workloads[{idx}].dtypes"
+            )
+
+            max_extent = self._max_tensor_extent(input_shapes, output_shapes)
+            configs = self._validate_configs_list(
+                workload_entry.get("configs"),
+                f"workloads[{idx}].configs",
+                workload_name,
+                max_extent,
+            )
+            workloads.append(
+                WorkloadSpec(
+                    name=workload_name,
+                    input_shapes=input_shapes,
+                    output_shapes=output_shapes,
+                    dtypes=dtypes,
+                    configs=configs,
+                )
+            )
 
         return ConfigGenerationResult(
-            configs=normalized_configs,
-            notes=str(notes).strip(),
+            kernel_name=kernel_name,
+            gpu_arch=gpu_arch,
+            workloads=workloads,
         )
+
+    @staticmethod
+    def _validate_non_empty_str(value: Any, field_name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"'{field_name}' must be a non-empty string")
+        return value.strip()
+
+    @staticmethod
+    def _validate_shapes_map(
+        value: Any, field_name: str
+    ) -> Dict[str, List[int]]:
+        if not isinstance(value, dict) or not value:
+            raise ValueError(f"'{field_name}' must be a non-empty object")
+        normalized: Dict[str, List[int]] = {}
+        for tensor_name, dims in value.items():
+            if not isinstance(tensor_name, str) or not tensor_name.strip():
+                raise ValueError(f"{field_name} keys must be non-empty strings")
+            if not isinstance(dims, list) or not dims:
+                raise ValueError(
+                    f"{field_name} -> '{tensor_name}' must be a non-empty list of integers"
+                )
+            normalized_dims: List[int] = []
+            for dim in dims:
+                if not isinstance(dim, int) or dim <= 0:
+                    raise ValueError(
+                        f"{field_name} -> '{tensor_name}' entries must be positive integers"
+                    )
+                normalized_dims.append(dim)
+            normalized[tensor_name.strip()] = normalized_dims
+        return normalized
+
+    @staticmethod
+    def _validate_dtypes_map(value: Any, field_name: str) -> Dict[str, str]:
+        if not isinstance(value, dict) or not value:
+            raise ValueError(f"'{field_name}' must be a non-empty object")
+        normalized: Dict[str, str] = {}
+        for tensor_name, dtype in value.items():
+            if not isinstance(tensor_name, str) or not tensor_name.strip():
+                raise ValueError(f"{field_name} keys must be non-empty strings")
+            if not isinstance(dtype, str) or not dtype.strip():
+                raise ValueError(
+                    f"{field_name} -> '{tensor_name}' values must be dtype strings"
+                )
+            normalized[tensor_name.strip()] = dtype.strip()
+        return normalized
+
+    def _validate_configs_list(
+        self,
+        value: Any,
+        field_name: str,
+        workload_name: str,
+        max_extent: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"'{field_name}' must be a non-empty list")
+        normalized: List[Dict[str, Any]] = []
+        for idx, config in enumerate(value):
+            if not isinstance(config, dict) or not config:
+                raise ValueError(
+                    f"{field_name}[{idx}] must be a non-empty object with tuning knobs"
+                )
+            normalized_config = {str(k): config[k] for k in config}
+            self._validate_block_size(
+                normalized_config, workload_name, max_extent, idx
+            )
+            normalized.append(normalized_config)
+        return normalized
+
+    @staticmethod
+    def _max_tensor_extent(*shape_maps: Dict[str, List[int]]) -> Optional[int]:
+        max_extent = 0
+        for shape_map in shape_maps:
+            for dims in shape_map.values():
+                extent = 1
+                for dim in dims:
+                    extent *= dim
+                max_extent = max(max_extent, extent)
+        return max_extent or None
+
+    @staticmethod
+    def _validate_block_size(
+        config: Dict[str, Any],
+        workload_name: str,
+        max_extent: Optional[int],
+        config_index: int,
+    ) -> None:
+        if max_extent is None or max_extent <= 0:
+            return
+        if "BLOCK_SIZE" not in config:
+            return
+        block_size = config["BLOCK_SIZE"]
+        if not isinstance(block_size, int):
+            raise ValueError(
+                f"workload '{workload_name}' config #{config_index} has non-integer BLOCK_SIZE"
+            )
+        if block_size <= 0:
+            raise ValueError(
+                f"workload '{workload_name}' config #{config_index} must use a positive BLOCK_SIZE"
+            )
+        if block_size > max_extent * 4:
+            raise ValueError(
+                f"workload '{workload_name}' config #{config_index} BLOCK_SIZE is too large for the declared tensor sizes"
+            )
 
 
 class ConfigAgent:
@@ -144,7 +324,9 @@ class ConfigAgent:
 
         prompt = self.prompt_builder.build_prompt(normalized_path, gpu_arch)
         response_text, query_error = await invoke_agent(
-            prompt, self.codex_options, normalized_path
+            prompt,
+            self.codex_options,
+            normalized_path,
         )
 
         if query_error:
@@ -166,21 +348,31 @@ class ConfigAgent:
             raise
 
 
-def write_config_file(configs: List[Dict[str, Any]], output_path: str) -> str:
-    """Write the configs list to disk and return the absolute path."""
+def write_config_file(result: ConfigGenerationResult, output_path: str) -> str:
+    """Write the workload-aware response to disk and return the absolute path."""
     if not output_path:
         raise ValueError("output_path is required")
-    if not isinstance(configs, list) or not configs:
-        raise ValueError("configs must be a non-empty list")
+    if not isinstance(result, ConfigGenerationResult):
+        raise ValueError("result must be a ConfigGenerationResult")
+    if not result.workloads:
+        raise ValueError("result must include at least one workload")
 
     absolute_path = os.path.abspath(output_path)
     os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
 
+    payload = asdict(result)
+    for workload in payload.get("workloads", []):
+        if workload.get("best_config") is None:
+            workload.pop("best_config", None)
+
     with open(absolute_path, "w", encoding="utf-8") as handle:
-        json.dump(configs, handle, indent=2)
+        json.dump(payload, handle, indent=2)
         handle.write("\n")
 
-    print(f"Wrote config list to {absolute_path}", file=sys.stderr)
+    print(
+        f"Wrote workload-aware tuning plan to {absolute_path}",
+        file=sys.stderr,
+    )
     return absolute_path
 
 
@@ -233,21 +425,23 @@ def _run_cli() -> None:
         args.gpu_arch,
     )
 
-    saved_path = write_config_file(result.configs, args.output)
+    saved_path = write_config_file(result, args.output)
 
-    payload = {
+    summary_payload = {
         "config_file": saved_path,
-        "config_count": len(result.configs),
-        "notes": result.notes,
+        "kernel_name": result.kernel_name,
+        "gpu_arch": result.gpu_arch,
+        "workload_count": len(result.workloads),
+        "workload_names": [workload.name for workload in result.workloads],
     }
-    json.dump(payload, sys.stdout, indent=2)
+    json.dump(summary_payload, sys.stdout, indent=2)
     sys.stdout.write("\n")
     sys.stdout.flush()
 
     if args.print_configs:
         separator = "\n" + ("-" * 40) + "\n"
         sys.stdout.write(separator)
-        json.dump(result.configs, sys.stdout, indent=2)
+        json.dump(asdict(result), sys.stdout, indent=2)
         sys.stdout.write("\n")
         sys.stdout.flush()
 
