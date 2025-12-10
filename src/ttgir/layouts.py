@@ -19,6 +19,10 @@ from triton.experimental.gluon.language._layouts import (
     SliceLayout,
     SwizzledSharedLayout,
 )
+from triton.experimental.gluon.language.amd._layouts import (
+    AMDMFMALayout,
+    AMDWMMALayout,
+)
 
 LayoutMetadata: TypeAlias = Union[
     AutoLayout,
@@ -29,6 +33,8 @@ LayoutMetadata: TypeAlias = Union[
     NVMMADistributedLayout,
     SliceLayout,
     NVMMASharedLayout,
+    AMDMFMALayout,
+    AMDWMMALayout,
     PaddedSharedLayout,
     SharedLinearLayout,
     SwizzledSharedLayout,
@@ -44,6 +50,8 @@ __all__ = [
     "DotOperandLayout",
     "NVMMADistributedLayout",
     "NVMMASharedLayout",
+    "AMDMFMALayout",
+    "AMDWMMALayout",
     "PaddedSharedLayout",
     "SharedLayout",
     "SharedLinearLayout",
