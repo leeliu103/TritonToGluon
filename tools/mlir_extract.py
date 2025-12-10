@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def extract_mlir_content(log_path: Path) -> list[str]:
-    """Return MLIR lines that follow the marker, skipping #loc definitions."""
+    """Return MLIR lines that follow the marker with #loc definitions at the end."""
     if not log_path.exists():
         raise FileNotFoundError(f"Log file not found: {log_path}")
 
@@ -55,12 +55,17 @@ def extract_mlir_content(log_path: Path) -> list[str]:
         len(lines),
     )
 
-    mlir_lines = [
-        line
-        for line in lines[marker_index + 1 : next_marker_index]
-        if not LOC_PATTERN.match(line)
-    ]
-    return mlir_lines
+    mlir_section = lines[marker_index + 1 : next_marker_index]
+    main_mlir_lines: list[str] = []
+    loc_lines: list[str] = []
+
+    for line in mlir_section:
+        if LOC_PATTERN.match(line):
+            loc_lines.append(line)
+        else:
+            main_mlir_lines.append(line)
+
+    return main_mlir_lines + loc_lines
 
 
 def main() -> int:
