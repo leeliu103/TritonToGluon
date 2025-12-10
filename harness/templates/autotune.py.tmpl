@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Autotuning harness for $kernel_name generated deterministically."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import torch
+import triton
+import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+CONFIG = $config_literal
+WORKLOAD_NAMES = $workload_names_literal
+PARAMETERS = $parameter_plan_literal
+AUTOTUNE_KEYS = $autotune_keys_literal
+GRID_FUNCTION_SRC = $grid_function_literal
+MODULE_PREAMBLE_SRC = $module_preamble_literal
+KERNEL_FILENAME = "$kernel_filename"
+KERNEL_NAME = "$kernel_name"
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=f"Autotune {KERNEL_NAME} for workloads: {', '.join(WORKLOAD_NAMES)}",
+    )
+    parser.add_argument(
+        "--workload",
+        required=True,
+        help="Name of the workload to autotune.",
+    )
+    return parser.parse_args()
+
+
+def _ensure_workload(name: str) -> dict[str, Any]:
+    for workload in CONFIG["workloads"]:
+        if workload["name"] == name:
+            return workload
+    valid = ", ".join(WORKLOAD_NAMES)
+    raise SystemExit(f"ERROR: Unknown workload '{name}'. Valid workloads: {valid}.")
+
+
+def _require_cuda_device() -> torch.device:
+    if not torch.cuda.is_available():
+        raise SystemExit("ERROR: CUDA device is required to run this harness.")
+    return torch.device("cuda")
+
+
+def _load_kernel():
+    import importlib.util
+
+    kernel_path = Path(__file__).resolve().parent / KERNEL_FILENAME
+    spec = importlib.util.spec_from_file_location("generated_kernel", kernel_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to import kernel from {kernel_path}")
+    module = importlib.util.module_from_spec(spec)
+    module.__dict__.setdefault("triton", triton)
+    module.__dict__.setdefault("tl", tl)
+    spec.loader.exec_module(module)
+    if MODULE_PREAMBLE_SRC:
+        exec(MODULE_PREAMBLE_SRC, {"triton": triton, "tl": tl}, module.__dict__)
+    try:
+        return getattr(module, KERNEL_NAME)
+    except AttributeError as exc:
+        raise RuntimeError(f"Kernel '{KERNEL_NAME}' not found in {kernel_path}") from exc
+
+
+def _resolve_dtype(name: str) -> torch.dtype:
+    if not name.startswith("torch."):
+        raise ValueError(f"Dtype '{name}' must start with 'torch.'")
+    attr = name.split(".", 1)[1]
+    dtype = getattr(torch, attr, None)
+    if dtype is None or not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported torch dtype: {name}")
+    return dtype
+
+
+def _eval_expression(value: Any, dims: dict[str, Any], scalars: dict[str, Any]) -> Any:
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        env: dict[str, Any] = {}
+        env.update(dims)
+        env.update(scalars)
+        try:
+            return eval(value, {"__builtins__": {}}, env)
+        except SyntaxError:
+            if value in env:
+                return env[value]
+            raise
+    return value
+
+
+def _normalize_shape(shape: list[Any], dims: dict[str, Any], scalars: dict[str, Any]) -> tuple[int, ...]:
+    return tuple(int(_eval_expression(entry, dims, scalars)) for entry in shape)
+
+
+def _create_tensor(spec: dict[str, Any], dims: dict[str, Any], scalars: dict[str, Any], device: torch.device) -> torch.Tensor:
+    if "shape" not in spec:
+        raise KeyError("Dense buffer spec must include 'shape'.")
+    shape = _normalize_shape(spec["shape"], dims, scalars)
+    dtype = _resolve_dtype(spec.get("dtype", "torch.float32"))
+    if "data" in spec:
+        data = torch.as_tensor(spec["data"], dtype=dtype, device=device)
+        return data.reshape(shape)
+    init = spec.get("init", "random")
+    if init == "random":
+        return torch.randn(shape, device=device, dtype=dtype)
+    if init == "zeros":
+        return torch.zeros(shape, device=device, dtype=dtype)
+    if init == "ones":
+        return torch.ones(shape, device=device, dtype=dtype)
+    if init == "uniform":
+        low = float(spec.get("low", 0.0))
+        high = float(spec.get("high", 1.0))
+        return torch.empty(shape, device=device, dtype=dtype).uniform_(low, high)
+    if init == "constant":
+        value = spec.get("value", 0.0)
+        return torch.full(shape, value, device=device, dtype=dtype)
+    if init == "bernoulli":
+        prob = float(spec.get("prob", 0.5))
+        temp = torch.empty(shape, device=device, dtype=torch.float32).bernoulli_(prob)
+        return temp.to(dtype)
+    raise ValueError(f"Unsupported init '{init}' for buffer.")
+
+
+def _materialize_tensor_list(name: str, spec: dict[str, Any], dims: dict[str, Any], scalars: dict[str, Any], device: torch.device) -> list[torch.Tensor]:
+    entries: list[dict[str, Any]] = []
+    if "elements" in spec:
+        base = {k: v for k, v in spec.items() if k not in ("kind", "elements", "shapes", "source")}
+        for element in spec["elements"]:
+            merged = dict(base)
+            merged.update(element)
+            entries.append(merged)
+    elif "shapes" in spec:
+        base = {k: v for k, v in spec.items() if k not in ("kind", "elements", "shapes", "source")}
+        for shape in spec["shapes"]:
+            merged = dict(base)
+            merged["shape"] = shape
+            entries.append(merged)
+    else:
+        raise KeyError(f"Tensor-list buffer '{name}' is missing 'elements' or 'shapes'.")
+    return [_create_tensor(entry, dims, scalars, device) for entry in entries]
+
+
+def _materialize_pointer_array(name: str, spec: dict[str, Any], buffers: dict[str, Any], device: torch.device) -> torch.Tensor:
+    source_name = spec.get("source")
+    if not source_name:
+        raise KeyError(f"Pointer-array buffer '{name}' must define 'source'.")
+    source_value = buffers.get(source_name)
+    if source_value is None:
+        raise KeyError(f"Pointer-array buffer '{name}' referenced unknown source '{source_name}'.")
+    tensors = source_value if isinstance(source_value, list) else [source_value]
+    addresses = [tensor.data_ptr() for tensor in tensors]
+    ptrs = torch.tensor(addresses, dtype=torch.int64, device=device)
+    dtype_name = spec.get("dtype")
+    if dtype_name:
+        ptrs = ptrs.to(_resolve_dtype(dtype_name))
+    return ptrs
+
+
+def _materialize_descriptor(name: str, spec: dict[str, Any], buffers: dict[str, Any], dims: dict[str, Any], scalars: dict[str, Any]) -> TensorDescriptor:
+    source_name = spec.get("source")
+    if not source_name:
+        raise KeyError(f"Descriptor buffer '{name}' must define 'source'.")
+    base = buffers.get(source_name)
+    if base is None:
+        raise KeyError(f"Descriptor buffer '{name}' referenced unknown source '{source_name}'.")
+    block_shape_spec = spec.get("block_shape")
+    if not block_shape_spec:
+        raise KeyError(f"Descriptor buffer '{name}' missing 'block_shape'.")
+    block_shape = [int(_eval_expression(entry, dims, scalars)) for entry in block_shape_spec]
+    shape_spec = spec.get("shape")
+    if shape_spec is None:
+        shape = list(base.shape)
+    else:
+        shape = [int(_eval_expression(entry, dims, scalars)) for entry in shape_spec]
+    strides_spec = spec.get("strides")
+    if strides_spec is None:
+        strides = list(base.stride())
+    else:
+        strides = [int(_eval_expression(entry, dims, scalars)) for entry in strides_spec]
+    padding = spec.get("padding", "zero")
+    return TensorDescriptor(base=base, shape=shape, strides=strides, block_shape=block_shape, padding=padding)
+
+
+def _materialize_buffers(workload: dict[str, Any], device: torch.device, dims: dict[str, Any], scalars: dict[str, Any]) -> dict[str, Any]:
+    specs = dict(workload.get("buffers", {}))
+    buffers: dict[str, Any] = {}
+    pending = dict(specs)
+    while pending:
+        progress = False
+        for name, spec in list(pending.items()):
+            kind = spec.get("kind", "dense")
+            if kind == "dense":
+                buffers[name] = _create_tensor(spec, dims, scalars, device)
+            elif kind == "tensor_list":
+                buffers[name] = _materialize_tensor_list(name, spec, dims, scalars, device)
+            elif kind == "pointer_array":
+                source = spec.get("source")
+                if source not in buffers:
+                    continue
+                buffers[name] = _materialize_pointer_array(name, spec, buffers, device)
+            elif kind == "descriptor":
+                source = spec.get("source")
+                if source not in buffers:
+                    continue
+                buffers[name] = _materialize_descriptor(name, spec, buffers, dims, scalars)
+            else:
+                raise ValueError(f"Unsupported buffer kind '{kind}' for '{name}'.")
+            pending.pop(name)
+            progress = True
+        if not progress:
+            unresolved = ", ".join(sorted(pending))
+            raise RuntimeError(f"Could not resolve buffer dependencies: {unresolved}")
+    return buffers
+
+
+def _collect_dimensions(workload: dict[str, Any]) -> dict[str, int]:
+    dims: dict[str, int] = {}
+    raw_dims = workload.get("dimensions", {})
+    for name, value in raw_dims.items():
+        dims[name] = int(_eval_expression(value, dims, {}))
+    return dims
+
+
+def _collect_scalars(workload: dict[str, Any], dims: dict[str, Any]) -> dict[str, Any]:
+    scalars: dict[str, Any] = {}
+    for name, value in workload.get("scalars", {}).items():
+        scalars[name] = _eval_expression(value, dims, scalars)
+    return scalars
+
+
+def _build_grid_lambda(dimensions: dict[str, int], scalars: dict[str, Any]):
+    env = {"triton": triton, "tl": tl, "dims": dimensions, "scalars": scalars}
+    env.update(dimensions)
+    grid_lambda = eval(GRID_FUNCTION_SRC, env)
+    if not callable(grid_lambda):
+        raise TypeError("Grid metadata must evaluate to a callable.")
+    return grid_lambda
+
+
+def _build_runtime_args(buffers: dict[str, Any], dims: dict[str, int], scalars: dict[str, Any]) -> list[Any]:
+    args: list[Any] = []
+    for spec in PARAMETERS:
+        kind = spec["kind"]
+        if kind == "tensor":
+            args.append(buffers[spec["buffer"]])
+        elif kind == "stride":
+            tensor = buffers[spec["buffer"]]
+            axis = int(spec["axis"])
+            args.append(int(tensor.stride()[axis]))
+        elif kind == "dimension":
+            args.append(int(dims[spec["symbol"]]))
+        elif kind == "scalar":
+            args.append(scalars[spec["key"]])
+        elif kind == "value":
+            args.append(_eval_expression(spec["value"], dims, scalars))
+        else:
+            raise ValueError(f"Unsupported runtime parameter kind '{kind}'.")
+    return args
+
+
+def _build_autotune_configs(workload: dict[str, Any]) -> list[triton.Config]:
+    configs: list[triton.Config] = []
+    for entry in workload.get("configs", []):
+        meta = dict(entry)
+        try:
+            num_warps = meta.pop("num_warps")
+            num_stages = meta.pop("num_stages")
+        except KeyError as exc:
+            raise KeyError("Each config must include 'num_warps' and 'num_stages'.") from exc
+        configs.append(triton.Config(meta, num_warps=num_warps, num_stages=num_stages))
+    if not configs:
+        raise ValueError("No autotune configs were defined for this workload.")
+    return configs
+
+
+def _save_best_config(workload_name: str, best_config: Any) -> Path:
+    cache_path = Path(__file__).resolve().parent / f"{workload_name}_best_config.json"
+    payload = {
+        "meta": dict(best_config.kwargs),
+        "num_warps": int(best_config.num_warps),
+        "num_stages": int(best_config.num_stages),
+    }
+    cache_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return cache_path
+
+
+def run(workload_name: str) -> None:
+    workload = _ensure_workload(workload_name)
+    device = _require_cuda_device()
+    torch.manual_seed(0)
+
+    dims = _collect_dimensions(workload)
+    scalars = _collect_scalars(workload, dims)
+    buffers = _materialize_buffers(workload, device, dims, scalars)
+    runtime_args = _build_runtime_args(buffers, dims, scalars)
+    configs = _build_autotune_configs(workload)
+    grid = _build_grid_lambda(dims, scalars)
+
+    base_kernel = _load_kernel()
+    autotune_kernel = triton.autotune(configs=configs, key=AUTOTUNE_KEYS)(base_kernel)
+    autotune_kernel[grid](*runtime_args)
+    torch.cuda.synchronize()
+
+    best_config = getattr(autotune_kernel, "best_config", None)
+    if best_config is None:
+        raise RuntimeError("Triton autotuner did not expose 'best_config'.")
+
+    cache_path = _save_best_config(workload_name, best_config)
+    print(f"Saved best config for {KERNEL_NAME} workload '{workload_name}' -> {cache_path}")
+
+
+def main() -> None:
+    args = _parse_args()
+    run(args.workload)
+
+
+if __name__ == "__main__":
+    main()

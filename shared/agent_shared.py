@@ -58,29 +58,38 @@ async def invoke_agent(
 ) -> Tuple[str, Optional[Exception]]:
     """Stream agent output into a single string while capturing any query errors."""
     response_text = ""
+    assistant_text = ""  # Track streaming assistant content for fallback responses.
     query_error: Optional[Exception] = None
 
     try:
         async for message in query(prompt=prompt, options=codex_options):
             if isinstance(message, AssistantMessage):
                 blocks = getattr(message, "content", None) or []
-                response_text += "".join(
+                assistant_text += "".join(
                     block.text for block in blocks if isinstance(block, TextBlock)
                 )
             elif isinstance(message, ResultMessage):
-                blocks = getattr(message, "content", None) or []
-                response_text += "".join(
-                    block.text for block in blocks if isinstance(block, TextBlock)
-                )
                 payload = getattr(message, "result", None)
-                if payload:
+                # Prefer the structured result payload when it exists.
+                if payload is not None:
                     if isinstance(payload, str):
-                        response_text += payload
+                        response_text = payload
                     else:
-                        response_text += json.dumps(payload)
+                        response_text = json.dumps(payload)
+                else:
+                    # Fall back to whatever the assistant streamed if no result payload.
+                    response_text = assistant_text
+
+                if getattr(message, "is_error", False):
+                    query_error = query_error or RuntimeError(
+                        f"Agent reported an error for {context_label}"
+                    )
     except Exception as exc:  # pragma: no cover - guard against agent issues
         query_error = exc
         print(f"Warning: Agent streaming failed for {context_label}: {exc}", file=sys.stderr)
+
+    if not response_text:
+        response_text = assistant_text
 
     return response_text, query_error
 

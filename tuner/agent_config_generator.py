@@ -7,8 +7,16 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
+
+# Ensure the project root (sibling of this file's directory) is importable even when
+# the script is invoked from arbitrary working directories.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import anyio
 from shared.agent_shared import (
@@ -19,28 +27,34 @@ from shared.agent_shared import (
 )
 
 
-CONFIG_AGENT_SYSTEM_PROMPT = (
-    "CRITICAL: You MUST use Codex MCP for ALL analysis and generation."
-    "Never rely on assumptions or prior knowledge—read the actual source code using Codex tools before making ANY decisions about parameters, shapes, or configs. "
-    "Every conclusion must be grounded in observable facts from the files you read with Codex tools.\n"
-    "You are a principal GPU kernel performance engineer and Triton autotuning specialist. "
-    "Always begin by opening the referenced Triton kernel with Codex MCP filesystem tools (read_file, rg) and study the code until every decorator, function parameter, tl.constexpr knob, loop, and tl.load/store is understood. "
-    "Base every conclusion strictly on facts visible in the source—do not speculate about compiler lowering, cache behavior, or register usage unless the code states it explicitly. "
-    "For each config, specify ALL compile-time parameters: BLOCK_SIZE, num_stages, num_warps, and any other kernel-specific tunables. "
-    "Do NOT omit num_warps—it is a critical launch parameter that affects performance.\n"
-    "Methodology:\n"
-    "1. Catalog every tunable/constexpr parameter along with explicit constraints from the source (assertions, divisibility, boundary guards).\n"
-    "2. Summarize the algorithm, tensor shapes, indexing math, and synchronization exactly as implemented—no hypothetical behavior.\n"
-    "3. Relate tunable knobs to problem sizes so you know when tiles, BLOCK_SIZE, or num_warps should scale with batch/sequence dimensions.\n"
-    "4. Apply GPU-specific heuristics tied to the requested architecture (e.g., RDNA warp granularity of 64, powers-of-two shapes, realistic num_warps/num_stages combinations).\n"
-    "5. Design 3-5 representative workloads that cover distinct real-world scenarios (small/medium/large batches, varying sequence lengths, etc.) and articulate how each stresses the kernel differently.\n"
-    "6. For every workload, craft several configs that satisfy kernel constraints, align with the workload's tensor sizes, and leverage the target GPU architecture.\n"
-    "Response requirements:\n"
-    "- Return exactly one JSON object with keys: `kernel_name`, `gpu_arch`, and `workloads`.\n"
-    "- Each workload must include: `name`, `input_shapes`, `output_shapes`, `dtypes`, and a `configs` list containing architecture-aware knob dictionaries.\n"
-    "- BLOCK_SIZE (or analogous tiling knobs) should be adapted to the workload's problem dimensions so that small workloads use smaller tiles than large ones.\n"
-    "- Do not include markdown fences, commentary outside the JSON object, or extra keys."
-)
+CONFIG_AGENT_SYSTEM_PROMPT = textwrap.dedent(
+    """
+    CRITICAL: Use Codex MCP filesystem tools to inspect the real Triton source before reasoning, and base every workload/config decision solely on observable facts.
+
+    Role & scope:
+    - You are a principal GPU performance engineer generating workload-aware Triton autotuning plans.
+    - You ONLY propose workloads and candidate configs; autotuning results are captured later by the harness.
+
+    Evidence-first workflow:
+    1. Open the referenced kernel with Codex MCP tools and study every @triton.jit function, tl.constexpr parameter, assertion, loop, and memory access pattern.
+    2. Capture all compile-time knobs (BLOCK_SIZE, num_warps, num_stages, and any custom tunables) plus explicit constraints present in the code (divisibility, tl.static_assert, guard conditions).
+    3. Relate tensor dimensions, indexing math, and synchronization behavior directly to those tunables so knob choices tie back to real shapes.
+    4. Apply GPU-architecture-specific heuristics for the requested target when proposing knob combinations.
+
+    Design requirements:
+    - Propose 3-5 representative workloads that span distinct usage regimes (small/medium/large, varying sequence lengths, etc.).
+    - For each workload, provide `name`, `input_shapes`, `output_shapes`, `dtypes`, and a `configs` list containing 2-4 knob dictionaries tailored to that workload.
+    - Ensure BLOCK_SIZE (or analogous tile knobs) scale with workload size, and include every compile-time parameter referenced in the kernel (BLOCK_SIZE, num_warps, num_stages, custom tl.constexpr values).
+    - Reject configs that violate kernel constraints, and never invent knobs that are not present in the source.
+    - Never emit cached autotuning results or extra fields; the harness persists tuning outcomes later.
+
+    JSON contract:
+    - Return exactly one JSON object with keys `kernel_name`, `gpu_arch`, and `workloads`.
+    - `kernel_name` must match the actual Triton entry point observed in source, and `gpu_arch` must echo the requested target.
+    - Lists must contain concrete tensor sizes and dtype strings (e.g., "torch.float16") with no ellipses or commentary.
+    - Do not wrap the JSON in markdown fences or include extra keys.
+    """
+).strip()
 
 
 def derive_default_output_path(kernel_path: str) -> str:
@@ -61,7 +75,6 @@ class WorkloadSpec:
     output_shapes: Dict[str, List[int]]
     dtypes: Dict[str, str]
     configs: List[Dict[str, Any]]
-    best_config: Optional[Dict[str, Any]] = None  # Added by harness after autotuning; reset to None when regenerating configs.
 
 
 @dataclass
@@ -78,58 +91,59 @@ class ConfigPromptBuilder:
 
     def build_prompt(self, kernel_path: str, gpu_arch: str) -> str:
         kernel_path = os.path.abspath(kernel_path)
-        template = (
-            "Prepare workload-aware Triton tuning configs for the specified kernel.\n"
-            f"Target kernel path: {kernel_path}\n"
-            f"Target GPU architecture: {gpu_arch}\n"
-            "Follow this process:\n"
-            "1. Use Codex MCP filesystem tools (read_file, rg) to fully inspect the kernel:\n"
-            "   - Read the kernel source file completely\n"
-            "   - Identify ALL @triton.jit functions\n"
-            "   - List ALL tl.constexpr parameters (BLOCK_SIZE, num_stages, num_warps, etc.)\n"
-            "   - Find ALL assertions, guards, or constraints in the code\n"
-            "   CRITICAL: Do this using Codex tools—never assume or guess the kernel structure.\n"
-            "2. Describe how tensor dimensions flow through the kernel (loops, indexing, blocking, tl.load/tl.store) purely from source evidence. Pay attention to how BLOCK_SIZE, TILE sizes, num_warps, and num_stages interact with batch/sequence lengths.\n"
-            "3. Derive ranges or preferred multiples for each tunable knob using code constraints plus GPU-specific heuristics for the requested architecture (warp granularity, LDS usage limits, etc.).\n"
-            "4. Propose 3-5 representative workloads that capture distinct real deployments (e.g., small_batch, medium_batch, long_sequence). Each workload must highlight different tensor shapes or batch/sequence lengths so autotuning can reason about scaling.\n"
-            "5. For every workload, specify: a descriptive name, input_shapes (dict of parameter -> shape list), output_shapes, and dtypes using torch dtype strings. Then craft 2-4 configs whose BLOCK_SIZE/tiling choices are a tight fit for that workload's tensor dimensions and GPU architecture. Larger workloads should prefer larger tiles than smaller workloads.\n"
-            "6. Reference the kernel's actual tunables only; do not invent knobs. Every config must include num_warps (typically 2, 4, 8, or 16 for RDNA GPUs) and you must choose num_warps based on occupancy and register pressure for each BLOCK_SIZE. Reject configs that violate tl.static_assert or divisibility requirements.\n"
-            "Output requirements:\n"
-            "- Emit exactly one JSON object matching:\n"
-            "{\n"
-            '  "kernel_name": "fused_softmax_kernel",\n'
-            '  "gpu_arch": "' + gpu_arch + '",\n'
-            '  "workloads": [\n'
-            '    {\n'
-            '      "name": "small_batch",\n'
-            '      "input_shapes": {"x": [1024, 256]},\n'
-            '      "output_shapes": {"y": [1024, 256]},\n'
-            '      "dtypes": {"x": "torch.float16", "y": "torch.float16"},\n'
-            '      "configs": [\n'
-            '        {"BLOCK_SIZE": 128, "num_stages": 2, "num_warps": 2},\n'
-            '        {"BLOCK_SIZE": 256, "num_stages": 3, "num_warps": 4}\n'
-            '      ]\n'
-            '    },\n'
-            '    {\n'
-            '      "name": "long_sequence",\n'
-            '      "input_shapes": {"q": [4096, 512], "k": [4096, 512]},\n'
-            '      "output_shapes": {"attn": [4096, 512]},\n'
-            '      "dtypes": {"q": "torch.float16", "k": "torch.float16", "attn": "torch.float16"},\n'
-            '      "configs": [\n'
-            '        {"BLOCK_SIZE": 256, "num_stages": 2, "num_warps": 4},\n'
-            '        {"BLOCK_SIZE": 512, "num_stages": 3, "num_warps": 8},\n'
-            '        {"BLOCK_SIZE": 1024, "num_stages": 3, "num_warps": 16}\n'
-            '      ]\n'
-            '    }\n'
-            '  ]\n'
-            "}\n"
-            "- Do not use ellipses (...) or placeholder text in the JSON output.\n"
-            "- Every list must contain complete, concrete objects.\n"
-            "- kernel_name must match the actual Triton function implemented at the provided path.\n"
-            "- workload configs must be GPU-specific, satisfy kernel constraints, and should align BLOCK_SIZE (or analogous tiles) with the workload's tensor sizes.\n"
-            "- Every config dictionary must include BLOCK_SIZE, num_stages, num_warps, and any other kernel-specific compile-time knobs derived directly from the code. Do NOT omit num_warps—it must come from Codex-driven evidence.\n"
-            "- Do not include markdown fences, commentary, or extra keys."
-        )
+        template = textwrap.dedent(
+            f"""
+            Prepare workload-aware Triton tuning configs.
+
+            Kernel path: {kernel_path}
+            Target GPU architecture: {gpu_arch}
+
+            Follow this process:
+              1. Use Codex MCP filesystem tools (read_file, rg, etc.) to inspect the kernel completely, list every @triton.jit entry point, and catalog each tl.constexpr/tunable parameter plus explicit constraints.
+              2. Describe how tensor dimensions propagate through loops, indexing, and tl.load/tl.store operations strictly from the source so knob choices tie back to real shapes.
+              3. Apply {gpu_arch}-specific heuristics when proposing BLOCK_SIZE, num_warps, num_stages, and any custom knobs, ensuring they satisfy the observed constraints.
+              4. Design 3-5 distinct workloads (e.g., small_batch, medium_batch, long_sequence) whose shapes stress the kernel differently, and for each workload craft 2-4 configs tuned to those shapes.
+
+            Output requirements:
+              - Return exactly one JSON object containing `kernel_name`, `gpu_arch`, and `workloads`.
+              - Each workload must include `name`, `input_shapes`, `output_shapes`, `dtypes`, and a `configs` list; every config must provide all compile-time knobs referenced in the kernel (BLOCK_SIZE, num_stages, num_warps, and any custom tl.constexpr values).
+              - Use concrete tensor sizes and torch dtype strings; never use ellipses or placeholder text.
+              - Exclude any cached tuning results; the harness records those values after autotuning completes.
+
+            Example JSON shape (no ellipses, no cached fields):
+              {{
+                "kernel_name": "<exact @triton.jit function name>",
+                "gpu_arch": "{gpu_arch}",
+                "workloads": [
+                  {{
+                    "name": "small_batch",
+                    "input_shapes": {{"x": [1024, 256]}},
+                    "output_shapes": {{"y": [1024, 256]}},
+                    "dtypes": {{"x": "torch.float16", "y": "torch.float16"}},
+                    "configs": [
+                      {{"BLOCK_SIZE": 128, "num_stages": 2, "num_warps": 2}},
+                      {{"BLOCK_SIZE": 256, "num_stages": 3, "num_warps": 4}}
+                    ]
+                  }},
+                  {{
+                    "name": "long_sequence",
+                    "input_shapes": {{"q": [4096, 512], "k": [4096, 512]}},
+                    "output_shapes": {{"attn": [4096, 512]}},
+                    "dtypes": {{"q": "torch.float16", "k": "torch.float16", "attn": "torch.float16"}},
+                    "configs": [
+                      {{"BLOCK_SIZE": 256, "num_stages": 2, "num_warps": 4}},
+                      {{"BLOCK_SIZE": 512, "num_stages": 3, "num_warps": 8}},
+                      {{"BLOCK_SIZE": 1024, "num_stages": 3, "num_warps": 16}}
+                    ]
+                  }}
+                ]
+              }}
+
+            Validation checklist before responding:
+              - Re-open {kernel_path} with Codex MCP tools to confirm the kernel name, tunables, and constraints you reference are accurate.
+              - Confirm the emitted JSON only contains workloads and configs derived from observable source constraints.
+            """
+        ).strip()
         return template
 
 
@@ -361,10 +375,6 @@ def write_config_file(result: ConfigGenerationResult, output_path: str) -> str:
     os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
 
     payload = asdict(result)
-    for workload in payload.get("workloads", []):
-        if workload.get("best_config") is None:
-            workload.pop("best_config", None)
-
     with open(absolute_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
