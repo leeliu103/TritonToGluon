@@ -55,3 +55,12 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
         else:
             c = accumulator.to(tl.float16)
         tl.store(c_ptrs, c, mask=c_mask)
+
+@triton.jit
+def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n

@@ -556,33 +556,8 @@ class ConfigResponseParser:
     def _sanitize_module_preamble(source: str) -> str:
         if not source:
             return ""
-        replacements = {
-            "triton.language.extra.cuda": "triton.language.extra",
-            "triton.language.cuda": "triton.language",
-        }
-        sanitized = source
-        for needle, replacement in replacements.items():
-            sanitized = sanitized.replace(needle, replacement)
-        sanitized = sanitized.strip("\n")
-        if sanitized and "_compute_pid" in sanitized:
-            return ConfigResponseParser._persistent_matmul_helper().strip("\n")
-        return sanitized
-
-    @staticmethod
-    def _persistent_matmul_helper() -> str:
-        return textwrap.dedent(
-            """
-            @triton.jit
-            def _compute_pid(tile_id, num_pid_in_group, num_pid_m, group_size_m, num_sms):
-                group_id = tile_id // num_pid_in_group
-                first_pid_m = group_id * group_size_m
-                remaining = num_pid_m - first_pid_m
-                group_size_m = tl.minimum(remaining, group_size_m)
-                pid_m = first_pid_m + (tile_id % group_size_m)
-                pid_n = (tile_id % num_pid_in_group) // group_size_m
-                return pid_m, pid_n
-            """
-        ).strip()
+        sanitized = source.replace("triton.language.cuda", "triton.language.extra")
+        return sanitized.strip("\n")
 
     def _expand_descriptor_workloads(self, workloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         expanded: List[Dict[str, Any]] = []
