@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import re
 import sys
 import textwrap
 from dataclasses import asdict, dataclass
@@ -29,30 +31,57 @@ from shared.agent_shared import (
 
 CONFIG_AGENT_SYSTEM_PROMPT = textwrap.dedent(
     """
-    CRITICAL: Use Codex MCP filesystem tools to inspect the real Triton source before reasoning, and base every workload/config decision solely on observable facts.
+    CRITICAL: Use Codex MCP filesystem tools to inspect the Triton source directly before reasoning. Every workload, dimension, and knob MUST be justified by explicit code you can point to.
 
     Role & scope:
-    - You are a principal GPU performance engineer generating workload-aware Triton autotuning plans.
-    - You ONLY propose workloads and candidate configs; autotuning results are captured later by the harness.
+    - Act as a principal GPU performance engineer preparing fully-specified autotuning plans for Triton kernels.
+    - You are responsible for providing runtime parameter wiring, launch grid metadata, representative workloads, and candidate autotune configs. The harness will execute and measure them later.
 
     Evidence-first workflow:
-    1. Open the referenced kernel with Codex MCP tools and study every @triton.jit function, tl.constexpr parameter, assertion, loop, and memory access pattern.
-    2. Capture all compile-time knobs (BLOCK_SIZE, num_warps, num_stages, and any custom tunables) plus explicit constraints present in the code (divisibility, tl.static_assert, guard conditions).
-    3. Relate tensor dimensions, indexing math, and synchronization behavior directly to those tunables so knob choices tie back to real shapes.
-    4. Apply GPU-architecture-specific heuristics for the requested target when proposing knob combinations.
+    1. Read the kernel completely (all @triton.jit entry points, tl.constexpr arguments, helper functions, assertions, and comments explaining constraints).
+    2. Enumerate every compile-time knob (BLOCK sizes, tile shapes, accumulator blocking, num_warps, num_stages, etc.) plus runtime parameters (tensor pointers, strides, scalar hyper-parameters, sizes).
+    3. Derive how tensors flow through the kernel: identify logical dimensions (M/N/K, sequence_len, head_dim, etc.), strides used in tl.load/tl.store, and any reductions or guards affecting launch grids.
+    4. Map those insights into a modular JSON plan that future tooling can consume without any kernel-specific tweaks.
 
-    Design requirements:
-    - Propose 3-5 representative workloads that span distinct usage regimes (small/medium/large, varying sequence lengths, etc.).
-    - For each workload, provide `name`, `input_shapes`, `output_shapes`, `dtypes`, and a `configs` list containing 2-4 knob dictionaries tailored to that workload.
-    - Ensure BLOCK_SIZE (or analogous tile knobs) scale with workload size, and include every compile-time parameter referenced in the kernel (BLOCK_SIZE, num_warps, num_stages, custom tl.constexpr values).
-    - Reject configs that violate kernel constraints, and never invent knobs that are not present in the source.
-    - Never emit cached autotuning results or extra fields; the harness persists tuning outcomes later.
+    JSON contract (return EXACTLY one object):
+    {
+      "kernel_name":   <string, exact @triton.jit name>,
+      "gpu_arch":      <string, echo of requested target>,
+      "parameters":    [
+         {"name": <arg_name>, "kind": "tensor"|"stride"|"dimension"|"scalar"|"value", ...}
+      ],
+      "metadata": {
+         "grid": <string of a lambda META: ... using dims/scalars> ,
+         "autotune_keys": [<runtime fields whose values change across workloads>],
+         "module_preamble": <optional helper definitions to exec before kernel lookup>
+      },
+      "workloads": [
+         {
+           "name": <string>,
+           "dimensions": {"M": 4096, "K": 256, ...},
+           "scalars": {"p": 0.3, "epsilon": 1e-5, ...},
+           "buffers": {
+             "x": {"kind": "dense", "shape": ["M", "K"], "dtype": "torch.float16", "init": "randn"},
+             "descs": {"kind": "descriptor", "source": "x", "block_shape": ["BLOCK_M", "BLOCK_K"]},
+             "ptrs": {"kind": "pointer_array", "source": "tensor_list_name"},
+             "tiles": {"kind": "tensor_list", "dtype": "torch.float16", "shapes": [[128, 64], ...]}
+           },
+           "configs": [
+             {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2},
+             {"BLOCK_M": 64,  "BLOCK_N": 256, "BLOCK_K": 32, "num_warps": 8, "num_stages": 3}
+           ]
+         }
+      ]
+    }
 
-    JSON contract:
-    - Return exactly one JSON object with keys `kernel_name`, `gpu_arch`, and `workloads`.
-    - `kernel_name` must match the actual Triton entry point observed in source, and `gpu_arch` must echo the requested target.
-    - Lists must contain concrete tensor sizes and dtype strings (e.g., "torch.float16") with no ellipses or commentary.
-    - Do not wrap the JSON in markdown fences or include extra keys.
+    Required behavior:
+    - Parameter list order MUST match the kernel signature (excluding tl.constexpr args) so harness wiring stays deterministic.
+    - `grid` must be a lambda string whose body can reference `dims`, `scalars`, `META`, or Triton helpers exactly as written in the kernel.
+    - Include every runtime buffer the kernel touches inside `buffers`, with concrete shapes/dtypes derived from the `dimensions` map.
+    - Every workload must stress a different, realistic usage regime (small/medium/large batch, narrow vs. wide matrices, etc.). Minimum of 3 workloads, maximum of 5.
+    - Each workload requires at least 2 candidate configs and each config must define ALL compile-time knobs mentioned in the kernel plus `num_warps` and `num_stages`.
+    - Never emit cached tuning results, timing data, or placeholder text. All tensor sizes/dtypes must be concrete and actionable.
+    - Do NOT wrap the JSON in markdown fences or add commentary outside of the JSON object.
     """
 ).strip()
 
@@ -67,23 +96,23 @@ def derive_default_output_path(kernel_path: str) -> str:
 
 
 @dataclass
-class WorkloadSpec:
-    """Description of a representative workload and its tailored configs."""
-
-    name: str
-    input_shapes: Dict[str, List[int]]
-    output_shapes: Dict[str, List[int]]
-    dtypes: Dict[str, str]
-    configs: List[Dict[str, Any]]
-
-
-@dataclass
 class ConfigGenerationResult:
-    """In-memory representation of the workload-aware response."""
+    """In-memory representation of the fully specified config payload."""
 
     kernel_name: str
     gpu_arch: str
-    workloads: List[WorkloadSpec]
+    parameters: List[Dict[str, Any]]
+    metadata: Dict[str, Any]
+    workloads: List[Dict[str, Any]]
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "kernel_name": self.kernel_name,
+            "gpu_arch": self.gpu_arch,
+            "parameters": self.parameters,
+            "metadata": self.metadata,
+            "workloads": self.workloads,
+        }
 
 
 class ConfigPromptBuilder:
@@ -93,55 +122,58 @@ class ConfigPromptBuilder:
         kernel_path = os.path.abspath(kernel_path)
         template = textwrap.dedent(
             f"""
-            Prepare workload-aware Triton tuning configs.
+            Prepare a self-contained Triton autotuning plan.
 
             Kernel path: {kernel_path}
             Target GPU architecture: {gpu_arch}
 
-            Follow this process:
-              1. Use Codex MCP filesystem tools (read_file, rg, etc.) to inspect the kernel completely, list every @triton.jit entry point, and catalog each tl.constexpr/tunable parameter plus explicit constraints.
-              2. Describe how tensor dimensions propagate through loops, indexing, and tl.load/tl.store operations strictly from the source so knob choices tie back to real shapes.
-              3. Apply {gpu_arch}-specific heuristics when proposing BLOCK_SIZE, num_warps, num_stages, and any custom knobs, ensuring they satisfy the observed constraints.
-              4. Design 3-5 distinct workloads (e.g., small_batch, medium_batch, long_sequence) whose shapes stress the kernel differently, and for each workload craft 2-4 configs tuned to those shapes.
+            You must:
+              1. Use Codex MCP filesystem tools only. Open the kernel, list the @triton.jit entry points, and document every runtime parameter (tensor ptrs, strides, dimensions, scalars) along with each tl.constexpr knob.
+              2. Summarize launch/grid logic from source (program_id decomposition, cdiv math, loops) so you can reconstruct the `grid` lambda precisely.
+              3. Identify all runtime buffers and how they map to logical dimensions. Provide dense/tensor_list/pointer_array/descriptor specs that the harness can materialize without editing future kernels.
+              4. Design 3-5 workloads covering distinct problem sizes. Each workload must include `dimensions`, `scalars`, `buffers`, and 2-4 candidate `configs` that set every compile-time knob (plus `num_warps`/`num_stages`).
 
-            Output requirements:
-              - Return exactly one JSON object containing `kernel_name`, `gpu_arch`, and `workloads`.
-              - Each workload must include `name`, `input_shapes`, `output_shapes`, `dtypes`, and a `configs` list; every config must provide all compile-time knobs referenced in the kernel (BLOCK_SIZE, num_stages, num_warps, and any custom tl.constexpr values).
-              - Use concrete tensor sizes and torch dtype strings; never use ellipses or placeholder text.
-              - Exclude any cached tuning results; the harness records those values after autotuning completes.
-
-            Example JSON shape (no ellipses, no cached fields):
+            JSON format to emit (no markdown, no commentary):
               {{
-                "kernel_name": "<exact @triton.jit function name>",
+                "kernel_name": "<exact name>",
                 "gpu_arch": "{gpu_arch}",
+                "parameters": [
+                  {{"name": "arg", "kind": "tensor", "buffer": "x"}},
+                  {{"name": "n_cols", "kind": "dimension", "symbol": "N"}},
+                  {{"name": "keep_prob", "kind": "scalar", "key": "p"}},
+                  {{"name": "seed", "kind": "value", "value": 0}}
+                ],
+                "metadata": {{
+                  "grid": "lambda META: (triton.cdiv(dims['M'], META['BLOCK_M']), dims['N'] // META['BLOCK_N'])",
+                  "autotune_keys": ["M", "N"],
+                  "module_preamble": "optional helper defs"
+                }},
                 "workloads": [
                   {{
                     "name": "small_batch",
-                    "input_shapes": {{"x": [1024, 256]}},
-                    "output_shapes": {{"y": [1024, 256]}},
-                    "dtypes": {{"x": "torch.float16", "y": "torch.float16"}},
+                    "dimensions": {{"M": 1024, "N": 256}},
+                    "scalars": {{"p": 0.2}},
+                    "buffers": {{
+                      "x": {{"kind": "dense", "shape": ["M", "N"], "dtype": "torch.float16", "init": "randn"}},
+                      "bias": {{"kind": "dense", "shape": ["N"], "dtype": "torch.float16", "init": "randn"}},
+                      "tiles": {{"kind": "tensor_list", "dtype": "torch.float16", "shapes": [[128, 128], [128, 64]]}},
+                      "tile_ptrs": {{"kind": "pointer_array", "source": "tiles"}},
+                      "x_desc": {{"kind": "descriptor", "source": "x", "block_shape": ["BLOCK_M", "BLOCK_N"]}}
+                    }},
                     "configs": [
-                      {{"BLOCK_SIZE": 128, "num_stages": 2, "num_warps": 2}},
-                      {{"BLOCK_SIZE": 256, "num_stages": 3, "num_warps": 4}}
-                    ]
-                  }},
-                  {{
-                    "name": "long_sequence",
-                    "input_shapes": {{"q": [4096, 512], "k": [4096, 512]}},
-                    "output_shapes": {{"attn": [4096, 512]}},
-                    "dtypes": {{"q": "torch.float16", "k": "torch.float16", "attn": "torch.float16"}},
-                    "configs": [
-                      {{"BLOCK_SIZE": 256, "num_stages": 2, "num_warps": 4}},
-                      {{"BLOCK_SIZE": 512, "num_stages": 3, "num_warps": 8}},
-                      {{"BLOCK_SIZE": 1024, "num_stages": 3, "num_warps": 16}}
+                      {{"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2}},
+                      {{"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 3}}
                     ]
                   }}
                 ]
               }}
 
-            Validation checklist before responding:
-              - Re-open {kernel_path} with Codex MCP tools to confirm the kernel name, tunables, and constraints you reference are accurate.
-              - Confirm the emitted JSON only contains workloads and configs derived from observable source constraints.
+            Validation checklist BEFORE responding:
+              - Parameter order exactly matches the kernel signature (ignoring tl.constexprs).
+              - All buffers have concrete shapes/dtypes derived from the dimension symbols.
+              - Every config sets identical knob keys across workloads and respects constraints noted in source (divisibility, limits, etc.).
+              - `autotune_keys` only references runtime dimension/scalar names defined above.
+              - No field is redundant or vague. If the kernel has custom helper lambdas (pid math, descriptor makers), capture them in `module_preamble` so harnesses stay deterministic.
             """
         ).strip()
         return template
@@ -163,46 +195,20 @@ class ConfigResponseParser:
         if not isinstance(workloads_data, list) or not workloads_data:
             raise ValueError("Agent response must include a non-empty 'workloads' list")
 
-        workloads: List[WorkloadSpec] = []
+        parameters = self._validate_parameters(data.get("parameters"))
+        metadata = self._validate_metadata(data.get("metadata"))
+
+        workloads: List[Dict[str, Any]] = []
         for idx, workload_entry in enumerate(workloads_data):
-            if not isinstance(workload_entry, dict):
-                raise ValueError(f"Workload #{idx} must be a JSON object")
+            workloads.append(self._validate_workload(idx, workload_entry))
 
-            workload_name = self._validate_non_empty_str(
-                workload_entry.get("name"), f"workloads[{idx}].name"
-            )
-            input_shapes = self._validate_shapes_map(
-                workload_entry.get("input_shapes"),
-                f"workloads[{idx}].input_shapes",
-            )
-            output_shapes = self._validate_shapes_map(
-                workload_entry.get("output_shapes"),
-                f"workloads[{idx}].output_shapes",
-            )
-            dtypes = self._validate_dtypes_map(
-                workload_entry.get("dtypes"), f"workloads[{idx}].dtypes"
-            )
-
-            max_extent = self._max_tensor_extent(input_shapes, output_shapes)
-            configs = self._validate_configs_list(
-                workload_entry.get("configs"),
-                f"workloads[{idx}].configs",
-                workload_name,
-                max_extent,
-            )
-            workloads.append(
-                WorkloadSpec(
-                    name=workload_name,
-                    input_shapes=input_shapes,
-                    output_shapes=output_shapes,
-                    dtypes=dtypes,
-                    configs=configs,
-                )
-            )
+        workloads = self._expand_descriptor_workloads(workloads)
 
         return ConfigGenerationResult(
             kernel_name=kernel_name,
             gpu_arch=gpu_arch,
+            parameters=parameters,
+            metadata=metadata,
             workloads=workloads,
         )
 
@@ -212,102 +218,426 @@ class ConfigResponseParser:
             raise ValueError(f"'{field_name}' must be a non-empty string")
         return value.strip()
 
-    @staticmethod
-    def _validate_shapes_map(
-        value: Any, field_name: str
-    ) -> Dict[str, List[int]]:
-        if not isinstance(value, dict) or not value:
-            raise ValueError(f"'{field_name}' must be a non-empty object")
-        normalized: Dict[str, List[int]] = {}
-        for tensor_name, dims in value.items():
-            if not isinstance(tensor_name, str) or not tensor_name.strip():
-                raise ValueError(f"{field_name} keys must be non-empty strings")
-            if not isinstance(dims, list) or not dims:
-                raise ValueError(
-                    f"{field_name} -> '{tensor_name}' must be a non-empty list of integers"
-                )
-            normalized_dims: List[int] = []
-            for dim in dims:
-                if not isinstance(dim, int) or dim <= 0:
-                    raise ValueError(
-                        f"{field_name} -> '{tensor_name}' entries must be positive integers"
-                    )
-                normalized_dims.append(dim)
-            normalized[tensor_name.strip()] = normalized_dims
-        return normalized
-
-    @staticmethod
-    def _validate_dtypes_map(value: Any, field_name: str) -> Dict[str, str]:
-        if not isinstance(value, dict) or not value:
-            raise ValueError(f"'{field_name}' must be a non-empty object")
-        normalized: Dict[str, str] = {}
-        for tensor_name, dtype in value.items():
-            if not isinstance(tensor_name, str) or not tensor_name.strip():
-                raise ValueError(f"{field_name} keys must be non-empty strings")
-            if not isinstance(dtype, str) or not dtype.strip():
-                raise ValueError(
-                    f"{field_name} -> '{tensor_name}' values must be dtype strings"
-                )
-            normalized[tensor_name.strip()] = dtype.strip()
-        return normalized
-
-    def _validate_configs_list(
-        self,
-        value: Any,
-        field_name: str,
-        workload_name: str,
-        max_extent: Optional[int],
-    ) -> List[Dict[str, Any]]:
+    def _validate_parameters(self, value: Any) -> List[Dict[str, Any]]:
         if not isinstance(value, list) or not value:
-            raise ValueError(f"'{field_name}' must be a non-empty list")
+            raise ValueError("Agent response must include a non-empty 'parameters' list")
         normalized: List[Dict[str, Any]] = []
-        for idx, config in enumerate(value):
-            if not isinstance(config, dict) or not config:
+        allowed_kinds = {"tensor", "stride", "dimension", "scalar", "value", "descriptor"}
+        for idx, entry in enumerate(value):
+            if not isinstance(entry, dict):
+                raise ValueError(f"parameters[{idx}] must be a JSON object")
+            normalized_entry = dict(entry)
+            name = self._validate_non_empty_str(entry.get("name"), f"parameters[{idx}].name")
+            kind = self._validate_non_empty_str(entry.get("kind"), f"parameters[{idx}].kind").lower()
+            if kind not in allowed_kinds:
                 raise ValueError(
-                    f"{field_name}[{idx}] must be a non-empty object with tuning knobs"
+                    f"parameters[{idx}].kind '{kind}' is not supported; expected one of {sorted(allowed_kinds)}"
                 )
-            normalized_config = {str(k): config[k] for k in config}
-            self._validate_block_size(
-                normalized_config, workload_name, max_extent, idx
-            )
-            normalized.append(normalized_config)
+            normalized_entry["name"] = name
+            normalized_entry["kind"] = kind
+            if kind in {"tensor", "stride", "descriptor"}:
+                buffer_name = self._validate_non_empty_str(
+                    entry.get("buffer"), f"parameters[{idx}].buffer"
+                )
+                normalized_entry["buffer"] = buffer_name
+            if kind == "stride":
+                axis = entry.get("axis")
+                if not isinstance(axis, int):
+                    raise ValueError(f"parameters[{idx}].axis must be an integer")
+                normalized_entry["axis"] = axis
+            if kind == "dimension":
+                symbol = self._validate_non_empty_str(
+                    entry.get("symbol"), f"parameters[{idx}].symbol"
+                )
+                normalized_entry["symbol"] = symbol
+            if kind == "scalar":
+                key_name = self._validate_non_empty_str(entry.get("key"), f"parameters[{idx}].key")
+                normalized_entry["key"] = key_name
+            if kind == "value":
+                if "value" not in entry:
+                    raise ValueError(f"parameters[{idx}] of kind 'value' must include 'value'")
+            normalized.append(normalized_entry)
         return normalized
 
-    @staticmethod
-    def _max_tensor_extent(*shape_maps: Dict[str, List[int]]) -> Optional[int]:
-        max_extent = 0
-        for shape_map in shape_maps:
-            for dims in shape_map.values():
-                extent = 1
-                for dim in dims:
-                    extent *= dim
-                max_extent = max(max_extent, extent)
-        return max_extent or None
+    def _validate_metadata(self, value: Any) -> Dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("Agent response must include a 'metadata' object")
+        normalized = dict(value)
+        grid_src = self._validate_non_empty_str(normalized.get("grid"), "metadata.grid")
+        autotune_raw = normalized.get("autotune_keys", [])
+        if not isinstance(autotune_raw, list):
+            raise ValueError("metadata.autotune_keys must be a list")
+        autotune_keys = [
+            self._validate_non_empty_str(key, f"metadata.autotune_keys[{idx}]")
+            for idx, key in enumerate(autotune_raw)
+        ]
+        module_preamble = normalized.get("module_preamble", "")
+        if module_preamble is None:
+            module_preamble = ""
+        elif not isinstance(module_preamble, str):
+            module_preamble = str(module_preamble)
+        module_preamble = self._sanitize_module_preamble(module_preamble)
+        normalized["grid"] = grid_src
+        normalized["autotune_keys"] = autotune_keys
+        normalized["module_preamble"] = module_preamble
+        return normalized
+
+    def _validate_workload(self, index: int, workload_entry: Any) -> Dict[str, Any]:
+        if not isinstance(workload_entry, dict):
+            raise ValueError(f"Workload #{index} must be a JSON object")
+        name = self._validate_non_empty_str(workload_entry.get("name"), f"workloads[{index}].name")
+        dimensions = self._validate_dimensions(index, workload_entry.get("dimensions"))
+        scalars = self._validate_scalars(index, workload_entry.get("scalars"))
+        buffers = self._validate_buffers(index, workload_entry.get("buffers"))
+        configs = self._validate_configs(index, workload_entry.get("configs"))
+
+        normalized = {
+            key: workload_entry[key]
+            for key in workload_entry
+            if key not in {"name", "dimensions", "scalars", "buffers", "configs"}
+        }
+        normalized.update(
+            {
+                "name": name,
+                "dimensions": dimensions,
+                "scalars": scalars,
+                "buffers": buffers,
+                "configs": configs,
+            }
+        )
+        return normalized
+
+    def _validate_dimensions(self, index: int, value: Any) -> Dict[str, Any]:
+        field = f"workloads[{index}].dimensions"
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        normalized: Dict[str, Any] = {}
+        for dim_name, dim_value in value.items():
+            name = self._validate_non_empty_str(dim_name, f"{field} key")
+            normalized[name] = self._validate_dim_expression(
+                dim_value, f"{field}['{name}']", allow_zero=False
+            )
+        return normalized
+
+    def _validate_scalars(self, index: int, value: Any) -> Dict[str, Any]:
+        field = f"workloads[{index}].scalars"
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        normalized: Dict[str, Any] = {}
+        for scalar_name, scalar_value in value.items():
+            name = self._validate_non_empty_str(scalar_name, f"{field} key")
+            normalized[name] = self._validate_scalar_value(
+                scalar_value, f"{field}['{name}']"
+            )
+        return normalized
+
+    def _validate_buffers(self, index: int, value: Any) -> Dict[str, Any]:
+        field = f"workloads[{index}].buffers"
+        if not isinstance(value, dict) or not value:
+            raise ValueError(f"{field} must be a non-empty object")
+        normalized: Dict[str, Any] = {}
+        for buffer_name, spec in value.items():
+            name = self._validate_non_empty_str(buffer_name, f"{field} key")
+            normalized[name] = self._validate_buffer_spec(name, spec, index)
+        return normalized
+
+    def _validate_buffer_spec(self, buffer_name: str, spec: Any, workload_index: int) -> Dict[str, Any]:
+        field = f"workloads[{workload_index}].buffers['{buffer_name}']"
+        if not isinstance(spec, dict):
+            raise ValueError(f"{field} must be an object describing the buffer")
+        kind = spec.get("kind", "dense")
+        kind = self._validate_non_empty_str(kind, f"{field}.kind").lower()
+        validators = {
+            "dense": self._validate_dense_buffer,
+            "tensor_list": self._validate_tensor_list_buffer,
+            "pointer_array": self._validate_pointer_array_buffer,
+            "descriptor": self._validate_descriptor_buffer,
+        }
+        if kind not in validators:
+            raise ValueError(
+                f"{field}.kind '{kind}' is not supported; expected one of {sorted(validators)}"
+            )
+        return validators[kind](spec, buffer_name, workload_index)
+
+    def _validate_dense_buffer(self, spec: Dict[str, Any], buffer_name: str, workload_index: int) -> Dict[str, Any]:
+        field = f"workloads[{workload_index}].buffers['{buffer_name}']"
+        normalized = dict(spec)
+        shape = normalized.get("shape")
+        dtype = normalized.get("dtype", "torch.float32")
+        normalized["kind"] = "dense"
+        normalized["shape"] = self._validate_shape_sequence(shape, f"{field}.shape")
+        normalized["dtype"] = self._validate_non_empty_str(dtype, f"{field}.dtype")
+        return normalized
+
+    def _validate_tensor_list_buffer(
+        self, spec: Dict[str, Any], buffer_name: str, workload_index: int
+    ) -> Dict[str, Any]:
+        field = f"workloads[{workload_index}].buffers['{buffer_name}']"
+        normalized = dict(spec)
+        dtype = normalized.get("dtype", "torch.float32")
+        normalized["kind"] = "tensor_list"
+        normalized["dtype"] = self._validate_non_empty_str(dtype, f"{field}.dtype")
+        if "elements" in normalized:
+            elements = normalized["elements"]
+            if not isinstance(elements, list) or not elements:
+                raise ValueError(f"{field}.elements must be a non-empty list")
+            normalized_elements = []
+            for elem_idx, element in enumerate(elements):
+                if not isinstance(element, dict):
+                    raise ValueError(f"{field}.elements[{elem_idx}] must be an object")
+                normalized_element = dict(element)
+                shape = normalized_element.get("shape")
+                normalized_element["shape"] = self._validate_shape_sequence(
+                    shape, f"{field}.elements[{elem_idx}].shape"
+                )
+                normalized_elements.append(normalized_element)
+            normalized["elements"] = normalized_elements
+        elif "shapes" in normalized:
+            shapes = normalized["shapes"]
+            if not isinstance(shapes, list) or not shapes:
+                raise ValueError(f"{field}.shapes must be a non-empty list")
+            normalized["shapes"] = [
+                self._validate_shape_sequence(shape, f"{field}.shapes[{idx}]")
+                for idx, shape in enumerate(shapes)
+            ]
+        else:
+            raise KeyError(f"{field} must define 'elements' or 'shapes'.")
+        return normalized
+
+    def _validate_pointer_array_buffer(
+        self, spec: Dict[str, Any], buffer_name: str, workload_index: int
+    ) -> Dict[str, Any]:
+        field = f"workloads[{workload_index}].buffers['{buffer_name}']"
+        normalized = dict(spec)
+        normalized["kind"] = "pointer_array"
+        source = self._validate_non_empty_str(normalized.get("source"), f"{field}.source")
+        normalized["source"] = source
+        dtype = normalized.get("dtype")
+        if dtype is not None:
+            normalized["dtype"] = self._validate_non_empty_str(dtype, f"{field}.dtype")
+        return normalized
+
+    def _validate_descriptor_buffer(
+        self, spec: Dict[str, Any], buffer_name: str, workload_index: int
+    ) -> Dict[str, Any]:
+        field = f"workloads[{workload_index}].buffers['{buffer_name}']"
+        normalized = dict(spec)
+        normalized["kind"] = "descriptor"
+        source = self._validate_non_empty_str(normalized.get("source"), f"{field}.source")
+        normalized["source"] = source
+        normalized["block_shape"] = self._validate_shape_sequence(
+            normalized.get("block_shape"), f"{field}.block_shape"
+        )
+        if "shape" in normalized:
+            normalized["shape"] = self._validate_shape_sequence(
+                normalized.get("shape"), f"{field}.shape"
+            )
+        if "strides" in normalized:
+            normalized["strides"] = self._validate_shape_sequence(
+                normalized.get("strides"), f"{field}.strides", allow_zero=True
+            )
+        padding = normalized.get("padding")
+        if padding is not None and not isinstance(padding, str):
+            normalized["padding"] = str(padding)
+        return normalized
+
+    def _validate_shape_sequence(
+        self, value: Any, field_name: str, allow_zero: bool = False
+    ) -> List[Any]:
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{field_name} must be a non-empty list")
+        normalized: List[Any] = []
+        for idx, entry in enumerate(value):
+            normalized.append(
+                self._validate_dim_expression(
+                    entry, f"{field_name}[{idx}]", allow_zero=allow_zero
+                )
+            )
+        return normalized
+
+    def _validate_configs(self, workload_index: int, value: Any) -> List[Dict[str, Any]]:
+        field = f"workloads[{workload_index}].configs"
+        if not isinstance(value, list) or len(value) < 2:
+            raise ValueError(f"{field} must include at least two config entries")
+        normalized: List[Dict[str, Any]] = []
+        expected_keys: Optional[set[str]] = None
+        for idx, entry in enumerate(value):
+            if not isinstance(entry, dict) or not entry:
+                raise ValueError(f"{field}[{idx}] must be a non-empty object")
+            if "num_warps" not in entry or "num_stages" not in entry:
+                raise KeyError(
+                    f"{field}[{idx}] must include both 'num_warps' and 'num_stages'"
+                )
+            normalized_entry: Dict[str, Any] = {}
+            for key, knob_value in entry.items():
+                normalized_entry[key] = self._validate_config_value(
+                    key, knob_value, workload_index, idx
+                )
+            key_set = set(normalized_entry.keys())
+            if expected_keys is None:
+                expected_keys = key_set
+            elif key_set != expected_keys:
+                raise ValueError(
+                    f"{field}[{idx}] must define the same knob keys as previous configs: {sorted(expected_keys)}"
+                )
+            normalized.append(normalized_entry)
+        return normalized
+
+    def _validate_dim_expression(
+        self, value: Any, field_name: str, allow_zero: bool
+    ) -> Any:
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must not be a boolean")
+        if isinstance(value, int):
+            if not allow_zero and value <= 0:
+                raise ValueError(f"{field_name} must be greater than zero")
+            if allow_zero and value < 0:
+                raise ValueError(f"{field_name} must be non-negative")
+            return value
+        if isinstance(value, float):
+            if not allow_zero and value <= 0:
+                raise ValueError(f"{field_name} must be greater than zero")
+            if allow_zero and value < 0:
+                raise ValueError(f"{field_name} must be non-negative")
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                raise ValueError(f"{field_name} strings must be non-empty")
+            return text
+        raise ValueError(f"{field_name} must be an int, float, or expression string")
+
+    def _validate_scalar_value(self, value: Any, field_name: str) -> Any:
+        if isinstance(value, (int, float, bool)):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                raise ValueError(f"{field_name} strings must be non-empty")
+            return text
+        raise ValueError(f"{field_name} must be numeric, boolean, or expression string")
+
+    def _validate_config_value(
+        self,
+        key: str,
+        value: Any,
+        workload_index: int,
+        config_index: int,
+    ) -> Any:
+        field = f"workloads[{workload_index}].configs[{config_index}].{key}"
+        if key in {"num_warps", "num_stages"}:
+            return self._require_positive_int(value, field)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                raise ValueError(f"{field} strings must be non-empty")
+            return text
+        raise ValueError(f"{field} must be numeric, boolean, or string")
 
     @staticmethod
-    def _validate_block_size(
-        config: Dict[str, Any],
-        workload_name: str,
-        max_extent: Optional[int],
-        config_index: int,
-    ) -> None:
-        if max_extent is None or max_extent <= 0:
-            return
-        if "BLOCK_SIZE" not in config:
-            return
-        block_size = config["BLOCK_SIZE"]
-        if not isinstance(block_size, int):
-            raise ValueError(
-                f"workload '{workload_name}' config #{config_index} has non-integer BLOCK_SIZE"
-            )
-        if block_size <= 0:
-            raise ValueError(
-                f"workload '{workload_name}' config #{config_index} must use a positive BLOCK_SIZE"
-            )
-        if block_size > max_extent * 4:
-            raise ValueError(
-                f"workload '{workload_name}' config #{config_index} BLOCK_SIZE is too large for the declared tensor sizes"
-            )
+    def _require_positive_int(value: Any, field_name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field_name} must be an integer")
+        if value <= 0:
+            raise ValueError(f"{field_name} must be greater than zero")
+        return value
+
+    @staticmethod
+    def _sanitize_module_preamble(source: str) -> str:
+        if not source:
+            return ""
+        replacements = {
+            "triton.language.extra.cuda": "triton.language.extra",
+            "triton.language.cuda": "triton.language",
+        }
+        sanitized = source
+        for needle, replacement in replacements.items():
+            sanitized = sanitized.replace(needle, replacement)
+        sanitized = sanitized.strip("\n")
+        if sanitized and "_compute_pid" in sanitized:
+            return ConfigResponseParser._persistent_matmul_helper().strip("\n")
+        return sanitized
+
+    @staticmethod
+    def _persistent_matmul_helper() -> str:
+        return textwrap.dedent(
+            """
+            @triton.jit
+            def _compute_pid(tile_id, num_pid_in_group, num_pid_m, group_size_m, num_sms):
+                group_id = tile_id // num_pid_in_group
+                first_pid_m = group_id * group_size_m
+                remaining = num_pid_m - first_pid_m
+                group_size_m = tl.minimum(remaining, group_size_m)
+                pid_m = first_pid_m + (tile_id % group_size_m)
+                pid_n = (tile_id % num_pid_in_group) // group_size_m
+                return pid_m, pid_n
+            """
+        ).strip()
+
+    def _expand_descriptor_workloads(self, workloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        expanded: List[Dict[str, Any]] = []
+        for workload in workloads:
+            tokens = self._descriptor_tokens(workload.get("buffers", {}))
+            configs = workload.get("configs", [])
+            if not tokens or not configs:
+                expanded.append(workload)
+                continue
+            token_list = sorted(tokens)
+            groups: Dict[tuple, List[Dict[str, Any]]] = {}
+            for config in configs:
+                key = tuple(config.get(token) for token in token_list)
+                groups.setdefault(key, []).append(config)
+            if len(groups) == 1:
+                scalars = dict(workload.get("scalars", {}))
+                key = next(iter(groups))
+                for token, value in zip(token_list, key):
+                    if value is not None:
+                        scalars.setdefault(token, value)
+                workload["scalars"] = scalars
+                expanded.append(workload)
+                continue
+            base_workload = copy.deepcopy(workload)
+            for idx, (key, grouped_configs) in enumerate(groups.items(), start=1):
+                clone = copy.deepcopy(base_workload)
+                clone["configs"] = grouped_configs
+                scalars = dict(clone.get("scalars", {}))
+                for token, value in zip(token_list, key):
+                    if value is not None:
+                        scalars[token] = value
+                clone["scalars"] = scalars
+                if idx > 1:
+                    clone["name"] = f"{clone['name']}_variant{idx}"
+                expanded.append(clone)
+        return expanded
+
+    def _descriptor_tokens(self, buffers: Dict[str, Any]) -> List[str]:
+        tokens: set[str] = set()
+        pattern = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+        for spec in buffers.values():
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("kind") != "descriptor":
+                continue
+            for field in ("block_shape", "shape", "strides"):
+                entries = spec.get(field)
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if isinstance(entry, str):
+                        for match in pattern.findall(entry):
+                            if match.isupper() or match.startswith("rep_"):
+                                tokens.add(match)
+        return list(tokens)
 
 
 class ConfigAgent:
@@ -437,12 +767,16 @@ def _run_cli() -> None:
 
     saved_path = write_config_file(result, args.output)
 
+    workload_names = [
+        workload.get("name", f"workload_{idx}")
+        for idx, workload in enumerate(result.workloads)
+    ]
     summary_payload = {
         "config_file": saved_path,
         "kernel_name": result.kernel_name,
         "gpu_arch": result.gpu_arch,
         "workload_count": len(result.workloads),
-        "workload_names": [workload.name for workload in result.workloads],
+        "workload_names": workload_names,
     }
     json.dump(summary_payload, sys.stdout, indent=2)
     sys.stdout.write("\n")

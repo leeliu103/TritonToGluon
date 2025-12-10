@@ -7,6 +7,9 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any
+import inspect
+import linecache
+import tempfile
 
 import torch
 import triton
@@ -21,11 +24,40 @@ GRID_FUNCTION_SRC = $grid_function_literal
 MODULE_PREAMBLE_SRC = $module_preamble_literal
 KERNEL_FILENAME = "$kernel_filename"
 KERNEL_NAME = "$kernel_name"
+GPU_ARCH = CONFIG.get("gpu_arch", "unknown")
+
+
+def _cast_random_tensor(base: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if getattr(dtype, "is_floating_point", False) or getattr(dtype, "is_complex", False):
+        return base.to(dtype)
+    if dtype == torch.bool:
+        return (base > 0).to(torch.bool)
+    return base.to(dtype)
+
+
+def _make_normal_random(shape: tuple[int, ...], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    base = torch.randn(shape, device=device, dtype=torch.float32)
+    return _cast_random_tensor(base, dtype)
+
+
+def _make_uniform_random(
+    shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+    low: float,
+    high: float,
+) -> torch.Tensor:
+    base = torch.rand(shape, device=device, dtype=torch.float32)
+    if high != 1.0 or low != 0.0:
+        base = base * (high - low) + low
+    return _cast_random_tensor(base, dtype)
 
 
 def _parse_args() -> argparse.Namespace:
+    workload_text = ", ".join(WORKLOAD_NAMES)
+    arch_suffix = f" (target GPU: {GPU_ARCH})" if GPU_ARCH else ""
     parser = argparse.ArgumentParser(
-        description=f"Run cached configs for {KERNEL_NAME} workloads: {', '.join(WORKLOAD_NAMES)}",
+        description=f"Run cached configs for {KERNEL_NAME} workloads: {workload_text}{arch_suffix}",
     )
     parser.add_argument(
         "--workload",
@@ -49,6 +81,59 @@ def _require_cuda_device() -> torch.device:
     return torch.device("cuda")
 
 
+def _with_triton_decorators(source: str) -> str:
+    lines = source.splitlines()
+    result: list[str] = []
+    prev_was_decorator = False
+    for line in lines:
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        if not stripped:
+            result.append(line)
+            prev_was_decorator = False
+            continue
+        if stripped.startswith("@"):
+            result.append(line)
+            prev_was_decorator = True
+            continue
+        if stripped.startswith("def ") and not indent:
+            if not prev_was_decorator:
+                result.append(f"{indent}@triton.jit")
+            result.append(line)
+            prev_was_decorator = False
+            continue
+        result.append(line)
+        prev_was_decorator = False
+    return "\n".join(result)
+
+
+def _apply_module_preamble(namespace: dict[str, Any], source: str) -> None:
+    baseline = set(namespace.keys())
+    decorated = _with_triton_decorators(source)
+    text = decorated if decorated.endswith("\n") else f"{decorated}\n"
+    cache_tag = f"{KERNEL_FILENAME}_{abs(hash(text))}"
+    tmp_path = Path(tempfile.gettempdir()) / f"triton_preamble_{cache_tag}.py"
+    tmp_path.write_text(text, encoding="utf-8")
+    filename = str(tmp_path)
+    linecache.cache[filename] = (len(text), None, text.splitlines(keepends=True), filename)
+    code = compile(text, filename, "exec")
+    exec(code, {"triton": triton, "tl": tl}, namespace)
+    module_name = namespace.get("__name__", "__main__")
+    for name, value in list(namespace.items()):
+        if name in baseline:
+            continue
+        if inspect.isfunction(value):
+            jit_fn = triton.jit(value)
+            jit_fn.__module__ = module_name
+            namespace[name] = jit_fn
+        else:
+            if hasattr(value, "__module__") and getattr(value, "__module__") is None:
+                try:
+                    value.__module__ = module_name
+                except Exception:
+                    pass
+
+
 def _load_kernel():
     import importlib.util
 
@@ -61,7 +146,7 @@ def _load_kernel():
     module.__dict__.setdefault("tl", tl)
     spec.loader.exec_module(module)
     if MODULE_PREAMBLE_SRC:
-        exec(MODULE_PREAMBLE_SRC, {"triton": triton, "tl": tl}, module.__dict__)
+        _apply_module_preamble(module.__dict__, MODULE_PREAMBLE_SRC)
     try:
         return getattr(module, KERNEL_NAME)
     except AttributeError as exc:
@@ -103,20 +188,42 @@ def _create_tensor(spec: dict[str, Any], dims: dict[str, Any], scalars: dict[str
         raise KeyError("Dense buffer spec must include 'shape'.")
     shape = _normalize_shape(spec["shape"], dims, scalars)
     dtype = _resolve_dtype(spec.get("dtype", "torch.float32"))
-    if "data" in spec:
-        data = torch.as_tensor(spec["data"], dtype=dtype, device=device)
+    literal_data = spec.get("data", None)
+    param_overrides: dict[str, Any] = {}
+    if isinstance(literal_data, dict):
+        override_keys = set(literal_data.keys())
+        if override_keys.issubset({"low", "high"}):
+            param_overrides = literal_data
+            literal_data = None
+    if literal_data is not None:
+        data = torch.as_tensor(literal_data, dtype=dtype, device=device)
         return data.reshape(shape)
     init = spec.get("init", "random")
-    if init == "random":
-        return torch.randn(shape, device=device, dtype=dtype)
+    if init in ("random", "randn", "normal"):
+        return _make_normal_random(shape, device, dtype)
+    if init == "rand":
+        low = float(spec.get("low", param_overrides.get("low", 0.0)))
+        high = float(spec.get("high", param_overrides.get("high", 1.0)))
+        return _make_uniform_random(shape, device, dtype, low, high)
     if init == "zeros":
         return torch.zeros(shape, device=device, dtype=dtype)
     if init == "ones":
         return torch.ones(shape, device=device, dtype=dtype)
     if init == "uniform":
-        low = float(spec.get("low", 0.0))
-        high = float(spec.get("high", 1.0))
-        return torch.empty(shape, device=device, dtype=dtype).uniform_(low, high)
+        low = float(spec.get("low", param_overrides.get("low", 0.0)))
+        high = float(spec.get("high", param_overrides.get("high", 1.0)))
+        return _make_uniform_random(shape, device, dtype, low, high)
+    if init == "randint":
+        low = int(spec.get("low", param_overrides.get("low", 0)))
+        high = int(spec.get("high", param_overrides.get("high", 2)))
+        data = torch.randint(low, high, shape, device=device)
+        return data.to(dtype)
+    if init == "custom":
+        values = spec.get("values")
+        if values is None:
+            raise KeyError("Custom init requires a 'values' field.")
+        data = torch.as_tensor(values, dtype=dtype, device=device)
+        return data.reshape(shape)
     if init == "constant":
         value = spec.get("value", 0.0)
         return torch.full(shape, value, device=device, dtype=dtype)
@@ -247,7 +354,7 @@ def _build_runtime_args(buffers: dict[str, Any], dims: dict[str, int], scalars: 
     args: list[Any] = []
     for spec in PARAMETERS:
         kind = spec["kind"]
-        if kind == "tensor":
+        if kind in ("tensor", "descriptor"):
             args.append(buffers[spec["buffer"]])
         elif kind == "stride":
             tensor = buffers[spec["buffer"]]
