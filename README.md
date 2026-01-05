@@ -17,9 +17,9 @@ Set up [AgentTemplate](https://github.com/leeliu103/AgentTemplate) before using 
    ```
    Then prompt: `tune the triton kernel for ../examples/01-vector-add`
 
-3. Run the convertor agent:
+3. Run the converter agent:
    ```bash
-   cd convertor
+   cd converter
    codex -c model_provider="amd-openai"
    ```
    Then prompt: `convert the triton kernel to gluon kernel for ../examples/01-vector-add`
@@ -30,7 +30,7 @@ Set up [AgentTemplate](https://github.com/leeliu103/AgentTemplate) before using 
 
 Tunes Triton kernel configurations for best performance. Generates shape/config JSON files and harness, then iterates on configs using IR dumps to optimize runtime.
 
-### Convertor Agent
+### Converter Agent
 
 Converts tuned Triton kernel to Gluon kernel. Uses TTGIR dumps to translate the kernel and iterates until correctness and performance targets are met.
 

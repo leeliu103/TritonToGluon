@@ -1,4 +1,4 @@
-Convertor Agent Guide
+Converter Agent Guide
 
 - Goal: using tuner outputs (`<base>.py`, `<base>-shape.json`, `<base>-config.json`, `<base>-triton-harness.py`), produce `<base>-gluon.py` that is correct and reaches a Triton/Gluon speedup ratio ≥ 0.99 using the conversion harness.
 - Skills: `generate-conversion-harness` to scaffold `<base>-conversion-harness.py`
