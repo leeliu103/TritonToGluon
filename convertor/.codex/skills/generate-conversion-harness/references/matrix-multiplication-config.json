@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 8,
+    "ACTIVATION": "none"
+  },
+  "launch": {
+    "num_warps": 4,
+    "num_stages": 2
+  },
+  "run": {
+    "warmup": 2,
+    "rep": 10
+  }
+}

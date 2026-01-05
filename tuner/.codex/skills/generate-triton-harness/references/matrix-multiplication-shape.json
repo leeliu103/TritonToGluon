@@ -1,0 +1,24 @@
+{
+  "seed": 0,
+  "inputs": [
+    {
+      "name": "a",
+      "shape": [1024, 1024],
+      "dtype": "float16"
+    },
+    {
+      "name": "b",
+      "shape": [1024, 1024],
+      "dtype": "float16"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "c",
+      "shape": [1024, 1024],
+      "dtype": "float16",
+      "initialize": "zeros"
+    }
+  ],
+  "grid": "lambda META, SHAPE: (triton.cdiv(1024, META['BLOCK_SIZE_M']) * triton.cdiv(1024, META['BLOCK_SIZE_N']),)"
+}
