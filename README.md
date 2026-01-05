@@ -23,12 +23,16 @@ An agentic framework for converting Triton kernels to Gluon kernels and optimizi
    ```
    Then prompt: `tune the triton kernel for ../examples/01-vector-add`
 
+   The agent will ask if you want to edit `<base>-shape.json` to customize tensor shapes before tuning.
+
 3. Run the converter agent:
    ```bash
    cd converter
    codex -c model_provider="amd-openai"
    ```
    Then prompt: `convert the triton kernel to gluon kernel for ../examples/01-vector-add`
+
+   The agent will ask for the target architecture (e.g., `rdna4`) and the path to your Triton repository.
 
 ## Agents
 
