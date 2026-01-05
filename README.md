@@ -4,7 +4,13 @@ An agentic framework for converting Triton kernels to Gluon kernels and optimizi
 
 ## Prerequisites
 
-Set up [AgentTemplate](https://github.com/leeliu103/AgentTemplate) before using this project.
+1. Set up [AgentTemplate](https://github.com/leeliu103/AgentTemplate) before using this project.
+
+2. Clone the upstream Triton repository:
+   ```bash
+   git clone git@github.com:triton-lang/triton.git
+   ```
+   The converter agent requires access to the Triton source code to understand op semantics during conversion.
 
 ## Usage
 
